@@ -1,12 +1,21 @@
 
-
-// main.js - V2: The complete client-side application
-
 // --- CONFIGURATION ---
 const SIGNALING_SERVER_URL = 'wss://webrtc-meeting-server.onrender.com'; // IMPORTANT: PASTE YOUR RENDER URL
+// main.js - V2.2: Fixes for media connection failures and mute button bug.
 
+// --- CRITICAL FIX 1: ADDED A TURN SERVER ---
+// This configuration tells the browser to first try a direct connection (STUN),
+// and if that fails, to use the TURN server as a guaranteed fallback relay.
 const configuration = {
-    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        // This free TURN server is for testing. For production, use a paid service like Twilio.
+        {
+            urls: 'turn:relay1.expressturn.com:3480',
+            username: '000000002076492763',
+            credential: 'c0gF9hE/qvrhetCJUVOMWrvbUa8='
+        }
+    ]
 };
 
 // --- DOM ELEMENTS ---
@@ -34,7 +43,6 @@ const shareModal = document.getElementById('share-modal');
 const modalRoomId = document.getElementById('modalRoomId');
 const copyRoomIdBtn = document.getElementById('copyRoomIdBtn');
 const closeModalBtn = document.getElementById('closeModalBtn');
-
 
 // --- APP STATE ---
 let localStream, myClientId, myRoomId, myUsername, adminToken, isAdmin = false, isMuted = false;
@@ -108,13 +116,25 @@ async function setupMeetingRoom() {
     if (isAdmin) {
         endMeetingBtn.style.display = 'block';
     }
+
+    // --- CRITICAL FIX 2: MOVED EVENT LISTENER SETUP ---
+    // The mute button listener is now set up *after* localStream is created.
+    muteSelfBtn.onclick = () => {
+        isMuted = !isMuted;
+        localStream.getAudioTracks()[0].enabled = !isMuted;
+        muteSelfBtn.innerText = isMuted ? 'Unmute' : 'Mute';
+        muteSelfBtn.classList.toggle('bg-red-600', isMuted);
+        muteSelfBtn.classList.toggle('bg-yellow-600', !isMuted);
+    };
 }
 
 function createPeerConnection(targetId, isOfferer) {
-    const pc = new RTCPeerConnection(configuration);
+    const pc = new RTCPeerConnection(configuration); // This now includes the TURN server
     peerConnections.set(targetId, pc);
 
-    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+    if (localStream) {
+        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+    }
 
     pc.ontrack = (event) => addVideoStream(targetId, event.streams[0], false, targetId);
     pc.onicecandidate = (event) => {
@@ -163,14 +183,6 @@ joinRoomBtn.onclick = () => {
             ws.send(JSON.stringify({ type: 'join_room', roomId, username: myUsername }));
         }
     }
-};
-
-muteSelfBtn.onclick = () => {
-    isMuted = !isMuted;
-    localStream.getAudioTracks()[0].enabled = !isMuted;
-    muteSelfBtn.innerText = isMuted ? 'Unmute' : 'Mute';
-    muteSelfBtn.classList.toggle('bg-red-600', isMuted);
-    muteSelfBtn.classList.toggle('bg-yellow-600', !isMuted);
 };
 
 leaveMeetingBtn.onclick = () => window.location.reload();
@@ -235,15 +247,13 @@ function addVideoStream(clientId, stream, isLocal = false, username) {
     container.appendChild(video);
     container.appendChild(nameTag);
     videoGrid.appendChild(container);
-
     updateParticipantsList();
 }
 
 function removePeer(clientId) {
     const videoContainer = document.getElementById(`video-container-${clientId}`);
-    if (videoContainer) {
-        videoContainer.remove();
-    }
+    if (videoContainer) videoContainer.remove();
+    
     peerConnections.get(clientId)?.close();
     peerConnections.delete(clientId);
     updateParticipantsList();
@@ -255,16 +265,13 @@ function updateParticipantsList() {
     const displayedClients = Array.from(videoGrid.children).map(container => {
         return container.id.substring('video-container-'.length);
     });
-
     participantCount.innerText = displayedClients.length;
     
     displayedClients.forEach(id => {
         const pDiv = document.createElement('div');
         pDiv.className = 'flex items-center justify-between bg-gray-700 p-2 rounded';
-        
         const nameTag = document.querySelector(`#video-container-${id} .video-name-tag`);
         pDiv.innerText = nameTag ? nameTag.innerText : id;
-        
         participantsList.appendChild(pDiv);
     });
 }
@@ -289,7 +296,7 @@ function handleAdminMute(targetId) {
     }
 }
 
-function showShareModal(roomId) {
+function showShareModal( roomId) {
     modalRoomId.innerText = roomId;
     shareModal.style.display = 'flex';
 }
