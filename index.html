@@ -3,36 +3,52 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebRTC Meeting Room</title>
+    <title>WebRTC Meeting Room V2</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <style> body { font-family: 'Inter', sans-serif; } video { transform: scaleX(-1); } </style>
+    <link rel="stylesheet" href="style.css">
 </head>
-<body class="bg-gray-900 text-gray-100">
+<body class="bg-gray-900 text-gray-100 overflow-hidden">
 
+    <!-- Landing Page -->
     <div id="landing-page" class="min-h-screen flex items-center justify-center">
-        <div class="text-center">
+        <div class="text-center bg-gray-800 p-8 rounded-lg shadow-xl">
             <h1 class="text-4xl font-bold text-indigo-400 mb-8">WebRTC Meeting Room</h1>
-            <button id="createRoomBtn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-6 rounded-lg text-lg">Create a New Room</button>
-            <div class="mt-6">
-                <input id="roomIdInput" type="text" placeholder="Enter Room ID to Join" class="p-3 bg-gray-700 rounded-l-lg text-center uppercase">
+            <input id="usernameInput" type="text" placeholder="Enter your name..." class="w-full p-3 mb-4 bg-gray-700 rounded-lg text-center text-lg">
+            <button id="createRoomBtn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-6 rounded-lg text-lg mb-4">Create a New Room</button>
+            <div class="flex">
+                <input id="roomIdInput" type="text" placeholder="Enter Room ID" class="flex-grow p-3 bg-gray-700 rounded-l-lg text-center uppercase">
                 <button id="joinRoomBtn" class="bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-r-lg">Join Room</button>
             </div>
         </div>
     </div>
 
+    <!-- Meeting Room -->
     <div id="meeting-room" class="hidden">
-        <div class="flex h-screen">
-            <div id="video-grid" class="flex-grow grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 p-4 bg-gray-800"></div>
-            <div class="w-80 bg-gray-900 p-4 flex flex-col">
-                <h2 class="text-xl font-bold mb-2">Room ID: <span id="roomIdDisplay" class="text-green-400 font-mono"></span></h2>
-                <div class="flex-grow">
-                    <h3 class="font-semibold mb-2">Participants</h3>
-                    <div id="participants-list" class="space-y-2"></div>
+        <div class="flex h-screen w-screen">
+            <!-- Main Content -->
+            <div class="flex-grow flex flex-col">
+                <div id="video-grid" class="flex-grow p-4"></div>
+                <!-- Bottom Control Bar -->
+                <div class="bg-gray-900 p-2 flex justify-center items-center space-x-4">
+                    <button id="muteSelfBtn" class="control-btn bg-yellow-600 text-black">Mute</button>
+                    <button id="leaveMeetingBtn" class="control-btn bg-red-600">Leave</button>
+                    <button id="endMeetingBtn" class="control-btn bg-red-800 hidden">End for All</button>
+                    <button id="toggleParticipantsBtn" class="control-btn bg-gray-600">Participants</button>
+                    <button id="toggleChatBtn" class="control-btn bg-gray-600">Chat</button>
                 </div>
-                <div class="mt-4 space-y-2">
-                    <button id="muteSelfBtn" class="w-full bg-yellow-600 text-black font-bold py-2 rounded">Mute Self</button>
-                    <button id="leaveMeetingBtn" class="w-full bg-gray-600 text-white font-bold py-2 rounded">Leave Meeting</button>
-                    <button id="endMeetingBtn" class="w-full bg-red-600 text-white font-bold py-2 rounded hidden">End Meeting for All</button>
+            </div>
+            <!-- Side Panel -->
+            <div id="side-panel" class="w-80 bg-gray-950 flex-col p-4 transform translate-x-full fixed right-0 top-0 h-full">
+                <!-- Participants Panel -->
+                <div id="participants-panel" class="flex-col h-full">
+                    <h3 class="text-xl font-bold mb-4">Participants (<span id="participant-count">0</span>)</h3>
+                    <div id="participants-list" class="flex-grow space-y-2 overflow-y-auto"></div>
+                </div>
+                <!-- Chat Panel -->
+                <div id="chat-panel" class="hidden flex-col h-full">
+                    <h3 class="text-xl font-bold mb-4">Chat</h3>
+                    <div id="chat-messages" class="flex-grow bg-gray-800 rounded p-2 overflow-y-auto mb-2"></div>
+                    <textarea id="chat-input" placeholder="Type a message..." rows="3" class="w-full p-2 bg-gray-700 rounded"></textarea>
                 </div>
             </div>
         </div>

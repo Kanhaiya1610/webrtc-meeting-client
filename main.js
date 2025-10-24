@@ -1,22 +1,11 @@
-// main.js
+
+
+// main.js - V2: The complete client-side application
 
 // --- CONFIGURATION ---
-// IMPORTANT: Replace this with your actual Render server URL
-const SIGNALING_SERVER_URL = 'wss://webrtc-meeting-server.onrender.com';
-
-// --- CRITICAL FIX: ADDED A TURN SERVER ---
-// This configuration tells the browser to first try a direct connection (STUN),
-// and if that fails, to use the TURN server as a guaranteed fallback relay.
+const SIGNALING_SERVER_URL = 'wss://webrtc-meeting-server.onrender.com'; // IMPORTANT: PASTE YOUR RENDER URL
 const configuration = {
-    iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        // This free TURN server is for testing. For production, use a paid service like Twilio.
-        {
-            urls: 'turn:relay1.expressturn.com:3480',
-            username: '000000002076492763',
-            credential: 'c0gF9hE/qvrhetCJUVOMWrvbUa8='
-        }
-    ]
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
 };
 
 // --- DOM ELEMENTS ---
@@ -25,19 +14,25 @@ const meetingRoom = document.getElementById('meeting-room');
 const createRoomBtn = document.getElementById('createRoomBtn');
 const joinRoomBtn = document.getElementById('joinRoomBtn');
 const roomIdInput = document.getElementById('roomIdInput');
+const usernameInput = document.getElementById('usernameInput');
 const videoGrid = document.getElementById('video-grid');
 const roomIdDisplay = document.getElementById('roomIdDisplay');
 const participantsList = document.getElementById('participants-list');
+const participantCount = document.getElementById('participant-count');
 const muteSelfBtn = document.getElementById('muteSelfBtn');
 const leaveMeetingBtn = document.getElementById('leaveMeetingBtn');
 const endMeetingBtn = document.getElementById('endMeetingBtn');
+const sidePanel = document.getElementById('side-panel');
+const toggleParticipantsBtn = document.getElementById('toggleParticipantsBtn');
+const toggleChatBtn = document.getElementById('toggleChatBtn');
+const participantsPanel = document.getElementById('participants-panel');
+const chatPanel = document.getElementById('chat-panel');
+const chatMessages = document.getElementById('chat-messages');
+const chatInput = document.getElementById('chat-input');
+
 
 // --- APP STATE ---
-let localStream;
-let myClientId;
-let myRoomId;
-let isAdmin = false;
-let isMuted = false;
+let localStream, myClientId, myRoomId, myUsername, adminToken, isAdmin = false, isMuted = false;
 const peerConnections = new Map();
 const ws = new WebSocket(SIGNALING_SERVER_URL);
 
@@ -48,12 +43,14 @@ ws.onmessage = async (message) => {
         case 'room_created':
             myRoomId = data.roomId;
             myClientId = data.clientId;
+            adminToken = data.adminToken;
             isAdmin = true;
             await setupMeetingRoom();
             break;
         case 'existing_participants':
             myRoomId = data.roomId;
             myClientId = data.clientId;
+            isAdmin = data.isAdmin;
             await setupMeetingRoom();
             data.participants.forEach(clientId => createPeerConnection(clientId, true));
             break;
@@ -61,13 +58,7 @@ ws.onmessage = async (message) => {
             createPeerConnection(data.clientId, false);
             break;
         case 'offer':
-            const pcOffer = peerConnections.get(data.fromId);
-            if (pcOffer) {
-                await pcOffer.setRemoteDescription(new RTCSessionDescription(data.sdp));
-                const answer = await pcOffer.createAnswer();
-                await pcOffer.setLocalDescription(answer);
-                ws.send(JSON.stringify({ type: 'answer', sdp: pcOffer.localDescription, targetId: data.fromId }));
-            }
+            await handleOffer(data.fromId, data.sdp);
             break;
         case 'answer':
             await peerConnections.get(data.fromId)?.setRemoteDescription(new RTCSessionDescription(data.sdp));
@@ -77,6 +68,12 @@ ws.onmessage = async (message) => {
             break;
         case 'peer_left':
             removePeer(data.clientId);
+            break;
+        case 'force_mute':
+            handleAdminMute(data.targetId);
+            break;
+        case 'new_chat_message':
+            displayChatMessage(data.from, data.message, data.timestamp);
             break;
         case 'meeting_ended':
             alert("The meeting has been ended by the host.");
@@ -95,7 +92,7 @@ async function setupMeetingRoom() {
     roomIdDisplay.innerText = myRoomId;
 
     localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    addVideoStream(myClientId, localStream, true);
+    addVideoStream(myClientId, localStream, true, myUsername);
 
     if (isAdmin) {
         endMeetingBtn.style.display = 'block';
@@ -104,12 +101,12 @@ async function setupMeetingRoom() {
 }
 
 function createPeerConnection(targetId, isOfferer) {
-    const pc = new RTCPeerConnection(configuration); // This now includes the TURN server
+    const pc = new RTCPeerConnection(configuration);
     peerConnections.set(targetId, pc);
 
     localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
 
-    pc.ontrack = (event) => addVideoStream(targetId, event.streams[0]);
+    pc.ontrack = (event) => addVideoStream(targetId, event.streams[0], false, targetId);
     pc.onicecandidate = (event) => {
         if (event.candidate) {
             ws.send(JSON.stringify({ type: 'ice_candidate', candidate: event.candidate, targetId }));
@@ -125,31 +122,85 @@ function createPeerConnection(targetId, isOfferer) {
     updateParticipantsList();
 }
 
+async function handleOffer(fromId, sdp) {
+    const pc = createPeerConnection(fromId, false);
+    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    ws.send(JSON.stringify({ type: 'answer', sdp: pc.localDescription, targetId: fromId }));
+}
+
 // --- UI & EVENT LISTENERS ---
-createRoomBtn.onclick = () => ws.send(JSON.stringify({ type: 'create_room' }));
+function checkUsername() {
+    myUsername = usernameInput.value.trim();
+    if (!myUsername) {
+        alert("Please enter your name.");
+        return false;
+    }
+    return true;
+}
+
+createRoomBtn.onclick = () => {
+    if (checkUsername()) {
+        ws.send(JSON.stringify({ type: 'create_room', username: myUsername }));
+    }
+};
+
 joinRoomBtn.onclick = () => {
-    const roomId = roomIdInput.value.toUpperCase();
-    if (roomId) {
-        ws.send(JSON.stringify({ type: 'join_room', roomId }));
+    if (checkUsername()) {
+        const roomId = roomIdInput.value.toUpperCase();
+        if (roomId) {
+            ws.send(JSON.stringify({ type: 'join_room', roomId, username: myUsername }));
+        }
     }
 };
 
 muteSelfBtn.onclick = () => {
     isMuted = !isMuted;
     localStream.getAudioTracks()[0].enabled = !isMuted;
-    muteSelfBtn.innerText = isMuted ? 'Unmute Self' : 'Mute Self';
+    muteSelfBtn.innerText = isMuted ? 'Unmute' : 'Mute';
+    muteSelfBtn.classList.toggle('bg-red-600', isMuted);
+    muteSelfBtn.classList.toggle('bg-yellow-600', !isMuted);
+
 };
 
 leaveMeetingBtn.onclick = () => window.location.reload();
-endMeetingBtn.onclick = () => ws.close();
+endMeetingBtn.onclick = () => {
+    if (isAdmin) {
+        ws.send(JSON.stringify({ type: 'end_meeting', roomId: myRoomId, adminToken }));
+    }
+};
+
+toggleParticipantsBtn.onclick = () => {
+    chatPanel.style.display = 'none';
+    participantsPanel.style.display = 'flex';
+    sidePanel.classList.toggle('translate-x-full');
+};
+
+toggleChatBtn.onclick = () => {
+    participantsPanel.style.display = 'none';
+    chatPanel.style.display = 'flex';
+    sidePanel.classList.toggle('translate-x-full');
+};
+
+chatInput.onkeydown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        const message = chatInput.value.trim();
+        if (message) {
+            ws.send(JSON.stringify({ type: 'chat_message', message }));
+            chatInput.value = '';
+        }
+    }
+};
 
 // --- HELPER FUNCTIONS ---
-function addVideoStream(clientId, stream, isLocal = false) {
+function addVideoStream(clientId, stream, isLocal = false, username) {
     if (document.getElementById(`video-container-${clientId}`)) return;
 
     const container = document.createElement('div');
     container.id = `video-container-${clientId}`;
-    container.className = 'relative';
+    container.className = 'video-container';
 
     const video = document.createElement('video');
     video.srcObject = stream;
@@ -158,12 +209,13 @@ function addVideoStream(clientId, stream, isLocal = false) {
     if (isLocal) video.muted = true;
 
     const nameTag = document.createElement('div');
-    nameTag.className = 'absolute bottom-2 left-2 bg-black bg-opacity-50 text-white px-2 py-1 rounded text-sm';
-    nameTag.innerText = clientId === myClientId ? `You (${clientId})` : clientId;
-
+    nameTag.className = 'video-name-tag';
+    nameTag.innerText = isLocal ? `You (${username})` : username;
+    
     container.appendChild(video);
     container.appendChild(nameTag);
     videoGrid.appendChild(container);
+    updateParticipantsList();
 }
 
 function removePeer(clientId) {
@@ -176,10 +228,32 @@ function removePeer(clientId) {
 function updateParticipantsList() {
     participantsList.innerHTML = '';
     const participants = [myClientId, ...Array.from(peerConnections.keys())];
+    participantCount.innerText = participants.length;
+    
     participants.forEach(id => {
-        const p = document.createElement('div');
-        p.className = 'bg-gray-700 p-2 rounded';
-        p.innerText = id;
-        participantsList.appendChild(p);
+        const pDiv = document.createElement('div');
+        pDiv.className = 'flex items-center justify-between bg-gray-700 p-2 rounded';
+        pDiv.innerText = id;
+        participantsList.appendChild(pDiv);
     });
+}
+
+function displayChatMessage(from, message, timestamp) {
+    const msgDiv = document.createElement('div');
+    msgDiv.className = 'mb-2';
+    msgDiv.innerHTML = `<p class="text-gray-400 text-xs">${from} - ${timestamp}</p><p class="bg-gray-700 p-2 rounded-lg inline-block">${message}</p>`;
+    chatMessages.appendChild(msgDiv);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+// Admin mute is not fully implemented in UI, this is the handler
+function handleAdminMute(targetId) {
+    if (targetId === myClientId) {
+        isMuted = true;
+        localStream.getAudioTracks()[0].enabled = false;
+        muteSelfBtn.innerText = 'Unmute';
+        muteSelfBtn.classList.add('bg-red-600');
+        muteSelfBtn.classList.remove('bg-yellow-600');
+        alert("The host has muted you.");
+    }
 }

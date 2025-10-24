@@ -1,0 +1,40 @@
+/* style.css */
+body { font-family: 'Inter', sans-serif; }
+
+#video-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 1rem;
+    align-content: start;
+}
+
+.video-container {
+    position: relative;
+    border: 2px solid #4A5568; /* border-gray-600 */
+    border-radius: 0.5rem;
+    overflow: hidden;
+    background-color: black;
+    aspect-ratio: 16 / 9;
+}
+
+.video-container video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    transform: scaleX(-1); /* Mirror self-view */
+}
+
+.video-name-tag {
+    position: absolute;
+    top: 0.5rem;
+    left: 0.5rem;
+    background-color: rgba(0, 0, 0, 0.5);
+    color: white;
+    padding: 0.25rem 0.5rem;
+    border-radius: 0.25rem;
+    font-size: 0.875rem;
+}
+
+#side-panel {
+    transition: transform 0.3s ease-in-out;
+}
