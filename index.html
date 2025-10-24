@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC Meeting Room</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style> body { font-family: 'Inter', sans-serif; } video { transform: scaleX(-1); } </style>
+</head>
+<body class="bg-gray-900 text-gray-100">
+
+    <div id="landing-page" class="min-h-screen flex items-center justify-center">
+        <div class="text-center">
+            <h1 class="text-4xl font-bold text-indigo-400 mb-8">WebRTC Meeting Room</h1>
+            <button id="createRoomBtn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-6 rounded-lg text-lg">Create a New Room</button>
+            <div class="mt-6">
+                <input id="roomIdInput" type="text" placeholder="Enter Room ID to Join" class="p-3 bg-gray-700 rounded-l-lg text-center uppercase">
+                <button id="joinRoomBtn" class="bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-r-lg">Join Room</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="meeting-room" class="hidden">
+        <div class="flex h-screen">
+            <div id="video-grid" class="flex-grow grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 p-4 bg-gray-800"></div>
+            <div class="w-80 bg-gray-900 p-4 flex flex-col">
+                <h2 class="text-xl font-bold mb-2">Room ID: <span id="roomIdDisplay" class="text-green-400 font-mono"></span></h2>
+                <div class="flex-grow">
+                    <h3 class="font-semibold mb-2">Participants</h3>
+                    <div id="participants-list" class="space-y-2"></div>
+                </div>
+                <div class="mt-4 space-y-2">
+                    <button id="muteSelfBtn" class="w-full bg-yellow-600 text-black font-bold py-2 rounded">Mute Self</button>
+                    <button id="leaveMeetingBtn" class="w-full bg-gray-600 text-white font-bold py-2 rounded">Leave Meeting</button>
+                    <button id="endMeetingBtn" class="w-full bg-red-600 text-white font-bold py-2 rounded hidden">End Meeting for All</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="main.js"></script>
+</body>
+</html>
