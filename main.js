@@ -4,6 +4,7 @@
 
 // --- CONFIGURATION ---
 const SIGNALING_SERVER_URL = 'wss://webrtc-meeting-server.onrender.com'; // IMPORTANT: PASTE YOUR RENDER URL
+
 const configuration = {
     iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
 };
@@ -29,6 +30,10 @@ const participantsPanel = document.getElementById('participants-panel');
 const chatPanel = document.getElementById('chat-panel');
 const chatMessages = document.getElementById('chat-messages');
 const chatInput = document.getElementById('chat-input');
+const shareModal = document.getElementById('share-modal');
+const modalRoomId = document.getElementById('modalRoomId');
+const copyRoomIdBtn = document.getElementById('copyRoomIdBtn');
+const closeModalBtn = document.getElementById('closeModalBtn');
 
 
 // --- APP STATE ---
@@ -46,6 +51,7 @@ ws.onmessage = async (message) => {
             adminToken = data.adminToken;
             isAdmin = true;
             await setupMeetingRoom();
+            showShareModal(myRoomId);
             break;
         case 'existing_participants':
             myRoomId = data.roomId;
@@ -91,13 +97,17 @@ async function setupMeetingRoom() {
     meetingRoom.style.display = 'block';
     roomIdDisplay.innerText = myRoomId;
 
-    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    addVideoStream(myClientId, localStream, true, myUsername);
+    try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        addVideoStream(myClientId, localStream, true, myUsername);
+    } catch (err) {
+        console.error("Error getting user media:", err);
+        alert("Could not access camera or microphone. Please check permissions and try again.");
+    }
 
     if (isAdmin) {
         endMeetingBtn.style.display = 'block';
     }
-    updateParticipantsList();
 }
 
 function createPeerConnection(targetId, isOfferer) {
@@ -161,7 +171,6 @@ muteSelfBtn.onclick = () => {
     muteSelfBtn.innerText = isMuted ? 'Unmute' : 'Mute';
     muteSelfBtn.classList.toggle('bg-red-600', isMuted);
     muteSelfBtn.classList.toggle('bg-yellow-600', !isMuted);
-
 };
 
 leaveMeetingBtn.onclick = () => window.location.reload();
@@ -194,6 +203,17 @@ chatInput.onkeydown = (e) => {
     }
 };
 
+copyRoomIdBtn.onclick = () => {
+    navigator.clipboard.writeText(myRoomId).then(() => {
+        copyRoomIdBtn.innerText = 'Copied!';
+        setTimeout(() => { copyRoomIdBtn.innerText = 'Copy'; }, 2000);
+    });
+};
+
+closeModalBtn.onclick = () => {
+    shareModal.style.display = 'none';
+};
+
 // --- HELPER FUNCTIONS ---
 function addVideoStream(clientId, stream, isLocal = false, username) {
     if (document.getElementById(`video-container-${clientId}`)) return;
@@ -215,25 +235,36 @@ function addVideoStream(clientId, stream, isLocal = false, username) {
     container.appendChild(video);
     container.appendChild(nameTag);
     videoGrid.appendChild(container);
+
     updateParticipantsList();
 }
 
 function removePeer(clientId) {
+    const videoContainer = document.getElementById(`video-container-${clientId}`);
+    if (videoContainer) {
+        videoContainer.remove();
+    }
     peerConnections.get(clientId)?.close();
     peerConnections.delete(clientId);
-    document.getElementById(`video-container-${clientId}`)?.remove();
     updateParticipantsList();
 }
 
 function updateParticipantsList() {
     participantsList.innerHTML = '';
-    const participants = [myClientId, ...Array.from(peerConnections.keys())];
-    participantCount.innerText = participants.length;
     
-    participants.forEach(id => {
+    const displayedClients = Array.from(videoGrid.children).map(container => {
+        return container.id.substring('video-container-'.length);
+    });
+
+    participantCount.innerText = displayedClients.length;
+    
+    displayedClients.forEach(id => {
         const pDiv = document.createElement('div');
         pDiv.className = 'flex items-center justify-between bg-gray-700 p-2 rounded';
-        pDiv.innerText = id;
+        
+        const nameTag = document.querySelector(`#video-container-${id} .video-name-tag`);
+        pDiv.innerText = nameTag ? nameTag.innerText : id;
+        
         participantsList.appendChild(pDiv);
     });
 }
@@ -241,14 +272,14 @@ function updateParticipantsList() {
 function displayChatMessage(from, message, timestamp) {
     const msgDiv = document.createElement('div');
     msgDiv.className = 'mb-2';
-    msgDiv.innerHTML = `<p class="text-gray-400 text-xs">${from} - ${timestamp}</p><p class="bg-gray-700 p-2 rounded-lg inline-block">${message}</p>`;
+    const senderName = from === myUsername ? 'You' : from;
+    msgDiv.innerHTML = `<p class="text-gray-400 text-xs">${senderName} - ${timestamp}</p><p class="bg-gray-700 p-2 rounded-lg inline-block">${message}</p>`;
     chatMessages.appendChild(msgDiv);
     chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
-// Admin mute is not fully implemented in UI, this is the handler
 function handleAdminMute(targetId) {
-    if (targetId === myClientId) {
+    if (targetId === myUsername) {
         isMuted = true;
         localStream.getAudioTracks()[0].enabled = false;
         muteSelfBtn.innerText = 'Unmute';
@@ -256,4 +287,9 @@ function handleAdminMute(targetId) {
         muteSelfBtn.classList.remove('bg-yellow-600');
         alert("The host has muted you.");
     }
+}
+
+function showShareModal(roomId) {
+    modalRoomId.innerText = roomId;
+    shareModal.style.display = 'flex';
 }
