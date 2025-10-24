@@ -4,15 +4,18 @@
 // IMPORTANT: Replace this with your actual Render server URL
 const SIGNALING_SERVER_URL = 'wss://webrtc-meeting-server.onrender.com';
 
+// --- CRITICAL FIX: ADDED A TURN SERVER ---
+// This configuration tells the browser to first try a direct connection (STUN),
+// and if that fails, to use the TURN server as a guaranteed fallback relay.
 const configuration = {
     iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
-        // For production, you MUST add a TURN server here for reliability
-        // {
-        //     urls: 'turn:your-turn-server.com:3478',
-        //     username: 'user',
-        //     credential: 'password'
-        // }
+        // This free TURN server is for testing. For production, use a paid service like Twilio.
+        {
+            urls: 'turn:relay1.expressturn.com:3480',
+            username: '000000002076492763',
+            credential: 'c0gF9hE/qvrhetCJUVOMWrvbUa8='
+        }
     ]
 };
 
@@ -101,7 +104,7 @@ async function setupMeetingRoom() {
 }
 
 function createPeerConnection(targetId, isOfferer) {
-    const pc = new RTCPeerConnection(configuration);
+    const pc = new RTCPeerConnection(configuration); // This now includes the TURN server
     peerConnections.set(targetId, pc);
 
     localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
