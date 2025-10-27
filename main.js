@@ -951,11 +951,23 @@ ws.onmessage = async (event) => {
     case "joined_room":
       roomId = data.roomId;
       document.getElementById("roomDisplay").innerText = `Joined Room: ${roomId}`;
+      console.log("Joined existing room. Waiting for offers...");
+      // DO NOT create offers here
+      break;
+    
+    case "peer_joined":
+      console.log("New peer joined:", data.clientId);
+      
+      // 🛡️ Avoid self-trigger: ignore your own join message
+      if (data.clientId === clientId) return;
+      
+      // 🧠 Only existing participants (not the joining one) create the offer
+      if (isAdmin || Object.keys(peers).length > 0) {
+        createOffer(data.clientId);
+      }
       break;
 
-    case "peer_joined":
-      createOffer(data.clientId);
-      break;
+
 
     case "offer":
       handleOffer(data);
