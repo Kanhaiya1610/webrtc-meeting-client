@@ -903,191 +903,401 @@
 // document.addEventListener('DOMContentLoaded', init);
 
 
+// frontend/main.js - revised and synced with your backend
 
-// frontend/main.js
-const ws = new WebSocket("wss://webrtc-meeting-server.onrender.com"); // change this URL
-let localStream;
-let peers = {};
-let clientId, roomId, isAdmin, adminToken;
+// ======== Configuration ========
+const WS_URL = "wss://webrtc-meeting-server.onrender.com";      // <--- update to your Render URL
+const ICE_ENDPOINT = "https://webrtc-meeting-server.onrender.com/ice"; // <--- update to your Render URL
+const GOOGLE_CLIENT_ID = "173379398027-i3h11rufg14tpde9rhutp0uvt3imos3k.apps.googleusercontent.com";// <--- set this
+
+// ======== Auth state ========
+let googleUser = null; // { email, name }
+function parseJwt(token) {
+  const base64Url = token.split('.')[1];
+  const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+  const jsonPayload = decodeURIComponent(atob(base64).split('').map(c => {
+    return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+  }).join(''));
+  return JSON.parse(jsonPayload);
+}
+
+// ======== Signaling & WebRTC state ========
+let ws = null;
+let localStream = null;
+const peers = {}; // peers[clientId] = RTCPeerConnection
+let clientId = null;
+let roomId = null;
+let isAdmin = false;
+let adminToken = null;
 let pcConfig = { iceServers: [] };
 
-async function getIceServers() {
+// ======== UI helpers (expect these IDs to exist in index.html) ========
+const localVideoEl = () => document.getElementById('localVideo');
+const remoteVideosContainer = () => document.getElementById('remoteVideos');
+const roomDisplayEl = () => document.getElementById('roomDisplay');
+const authStatusEl = () => document.getElementById('authStatus');
+const gSignInDiv = () => document.getElementById('gSignInDiv');
+
+// ======== Initialization ========
+async function loadIceServers() {
   try {
-    const res = await fetch("wss://webrtc-meeting-server.onrender.com/ice");
+    const res = await fetch(ICE_ENDPOINT);
     const data = await res.json();
-    pcConfig.iceServers = data.iceServers;
-    console.log("ICE servers:", pcConfig.iceServers);
+    pcConfig.iceServers = data.iceServers || [{ urls: 'stun:stun.l.google.com:19302' }];
+    console.log('Loaded ICE servers:', pcConfig.iceServers);
   } catch (err) {
-    console.error("Failed to load ICE servers", err);
-    pcConfig.iceServers = [{ urls: "stun:stun.l.google.com:19302" }];
+    console.warn('Failed to fetch ICE servers, falling back to public STUN.', err);
+    pcConfig.iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
   }
 }
 
-async function init() {
-  await getIceServers();
-  localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-  document.getElementById("localVideo").srcObject = localStream;
-}
-
-ws.onmessage = async (event) => {
-  const data = JSON.parse(event.data);
-
-  switch (data.type) {
-    case "your_info":
-      clientId = data.clientId;
-      isAdmin = data.isAdmin || false;
-      adminToken = data.adminToken;
-      if (isAdmin) console.log("You are admin:", adminToken);
-      break;
-
-    case "room_created":
-      roomId = data.roomId;
-      isAdmin = true;
-      adminToken = data.adminToken;
-      document.getElementById("roomDisplay").innerText = `Room: ${roomId}`;
-      alert(`Room created! Share this code: ${roomId}`);
-      break;
-
-    case "joined_room":
-      roomId = data.roomId;
-      document.getElementById("roomDisplay").innerText = `Joined Room: ${roomId}`;
-      console.log("Joined existing room. Waiting for offers...");
-      // DO NOT create offers here
-      break;
-    
-    case "peer_joined":
-      console.log("New peer joined:", data.clientId);
-      
-      // 🛡️ Avoid self-trigger: ignore your own join message
-      if (data.clientId === clientId) return;
-      
-      // 🧠 Only existing participants (not the joining one) create the offer
-      if (isAdmin || Object.keys(peers).length > 0) {
-        createOffer(data.clientId);
-      }
-      break;
-
-
-
-    case "offer":
-      handleOffer(data);
-      break;
-
-    case "answer":
-      handleAnswer(data);
-      break;
-
-    case "candidate":
-      if (peers[data.from]) {
-        peers[data.from].addIceCandidate(new RTCIceCandidate(data.candidate));
-      }
-      break;
-
-    case "meeting_ended":
-      alert("Meeting ended by admin");
-      location.reload();
-      break;
-
-    case "peer_left":
-      if (peers[data.clientId]) {
-        peers[data.clientId].close();
-        delete peers[data.clientId];
-      }
-      break;
+function initGoogleSignIn() {
+  if (!window.google || !google.accounts || !google.accounts.id) {
+    console.warn('Google Identity SDK not loaded (script tag missing).');
+    return;
   }
-};
-
-function createRoom() {
-  ws.send(JSON.stringify({ type: "create_room" }));
+  google.accounts.id.initialize({
+    client_id: GOOGLE_CLIENT_ID,
+    callback: handleCredentialResponse,
+    auto_select: false
+  });
+  google.accounts.id.renderButton(gSignInDiv(), { theme: 'outline', size: 'large' });
+  // optional auto prompt
+  // google.accounts.id.prompt();
 }
 
-function joinRoom() {
-  const id = prompt("Enter room ID:");
-  ws.send(JSON.stringify({ type: "join_room", roomId: id }));
+function handleCredentialResponse(response) {
+  try {
+    const payload = parseJwt(response.credential);
+    googleUser = { email: payload.email, name: payload.name || payload.email.split('@')[0] };
+    console.log('Google signed in:', googleUser);
+    if (authStatusEl()) authStatusEl().innerText = `Signed in as ${googleUser.name}`;
+    if (gSignInDiv()) gSignInDiv().style.display = 'none';
+  } catch (err) {
+    console.error('Failed to parse Google credential', err);
+  }
+}
+
+// initialize on DOM ready
+document.addEventListener('DOMContentLoaded', async () => {
+  // load ICE servers as soon as possible
+  await loadIceServers();
+
+  // init Google sign-in widget (requires <script src="https://accounts.google.com/gsi/client"> in index.html)
+  try { initGoogleSignIn(); } catch (e) { console.warn('Google init error', e); }
+
+  // create websocket connection (but we only send create/join after sign in)
+  initWebSocket();
+});
+
+// ======== WebSocket setup ========
+function initWebSocket() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    console.log('WebSocket connected to signaling server');
+  };
+  ws.onmessage = async (evt) => {
+    const data = JSON.parse(evt.data);
+    // console.log('WS in:', data);
+    switch (data.type) {
+      case 'your_info':
+        clientId = data.clientId;
+        // If server marks you admin, pick up token
+        isAdmin = !!data.isAdmin;
+        adminToken = data.adminToken || adminToken;
+        if (data.roomId) {
+          roomId = data.roomId;
+          if (roomDisplayEl()) roomDisplayEl().innerText = `Room: ${roomId}`;
+        }
+        console.log('your_info:', { clientId, isAdmin, adminToken, roomId });
+        break;
+
+      case 'room_created':
+        roomId = data.roomId;
+        if (roomDisplayEl()) roomDisplayEl().innerText = `Room: ${roomId}`;
+        alert(`Room created: ${roomId} — share this code`);
+        break;
+
+      case 'room_state':
+        // data.participants is array of existing participants (exclude self)
+        console.log('room_state received', data.participants);
+        // For each participant, create a peer connection as offerer
+        for (const p of data.participants) {
+          // p: { clientId, username, isMuted }
+          if (p.clientId === clientId) continue;
+          console.log('Creating offer to existing participant', p.clientId);
+          await ensureLocalStream(); // ensure we have local stream before offering
+          createOffer(p.clientId);
+        }
+        break;
+
+      case 'peer_joined':
+        // new peer joined the room (server excludes the newcomer)
+        console.log('peer_joined:', data.clientId);
+        // Only existing participants should create offer toward newcomer.
+        // If you are already in the room (roomId set), create an offer.
+        if (roomId && data.clientId !== clientId) {
+          await ensureLocalStream();
+          createOffer(data.clientId);
+        }
+        break;
+
+      case 'offer':
+        // payload forwarded from server includes: from (clientId), sdp
+        console.log('offer from', data.from);
+        await ensureLocalStream();
+        await handleOfferFromPeer(data.from, data.sdp, data.fromUsername);
+        break;
+
+      case 'answer':
+        console.log('answer from', data.from);
+        await handleAnswerFromPeer(data.from, data.sdp);
+        break;
+
+      case 'ice_candidate':
+        // data.from, data.candidate
+        if (peers[data.from]) {
+          try {
+            await peers[data.from].addIceCandidate(new RTCIceCandidate(data.candidate));
+            // console.log('Added remote ICE candidate from', data.from);
+          } catch (e) {
+            console.warn('Failed to add remote ICE candidate', e);
+          }
+        }
+        break;
+
+      case 'force_mute':
+        console.log('force_mute', data);
+        if (data.muteState && localStream) {
+          localStream.getAudioTracks().forEach(t => t.enabled = false);
+          alert('You were muted by the host');
+        }
+        break;
+
+      case 'new_chat_message':
+        // basic display integration, requires chat UI
+        console.log('chat:', data.fromUsername, data.message);
+        appendChatMessage(data.fromUsername, data.message, data.timestamp, data.fromClientId === clientId);
+        break;
+
+      case 'peer_left':
+        console.log('peer_left', data.clientId);
+        removePeerAndVideo(data.clientId);
+        break;
+
+      case 'meeting_ended':
+        alert('Meeting ended by host');
+        // cleanup
+        teardownLocalAndPeers();
+        location.reload();
+        break;
+
+      case 'error':
+        console.error('Server error:', data.message);
+        alert(`Server error: ${data.message}`);
+        break;
+
+      default:
+        console.warn('Unhandled WS msg type', data.type);
+    }
+  };
+
+  ws.onclose = () => {
+    console.log('WebSocket closed');
+  };
+
+  ws.onerror = (err) => {
+    console.error('WebSocket error', err);
+  };
+}
+
+// ======== Helpers: local media ========
+async function ensureLocalStream() {
+  if (localStream) return;
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    const el = localVideoEl();
+    if (el) {
+      el.srcObject = localStream;
+      el.autoplay = true;
+      el.muted = true; // mute local preview
+      el.playsInline = true;
+    }
+  } catch (err) {
+    console.error('getUserMedia failed', err);
+    alert('Could not access camera/microphone. Please allow permissions.');
+    throw err;
+  }
+}
+
+// ======== Room actions (create/join/end) ========
+async function createRoom() {
+  if (!googleUser) return alert('Please sign in with Google before creating a room.');
+  if (!ws || ws.readyState !== WebSocket.OPEN) return alert('Not connected to signaling server yet.');
+  await ensureLocalStream();
+  // send create_room with identity and username
+  ws.send(JSON.stringify({ type: 'create_room', username: googleUser.name, identity: { email: googleUser.email } }));
+}
+
+async function joinRoomPrompt() {
+  if (!googleUser) return alert('Please sign in with Google before joining.');
+  const id = prompt('Enter room ID:');
+  if (!id) return;
+  await ensureLocalStream();
+  ws.send(JSON.stringify({ type: 'join_room', roomId: id.toUpperCase(), username: googleUser.name, identity: { email: googleUser.email } }));
 }
 
 function endMeeting() {
-  if (isAdmin) {
-    ws.send(JSON.stringify({ type: "end_meeting", adminToken }));
-  } else {
-    alert("Only admin can end the meeting.");
+  if (!isAdmin) return alert('Only admin can end meeting.');
+  ws.send(JSON.stringify({ type: 'end_meeting', adminToken }));
+}
+
+// ======== Peer connection helpers ========
+function createPeerConnectionFor(id) {
+  if (peers[id]) {
+    return peers[id];
   }
+  const pc = new RTCPeerConnection(pcConfig);
+  peers[id] = pc;
+
+  // add local tracks
+  if (localStream) {
+    for (const track of localStream.getTracks()) {
+      try { pc.addTrack(track, localStream); } catch (e) { console.warn('addTrack failed', e); }
+    }
+  }
+
+  // remote track handling
+  pc.ontrack = (e) => {
+    // Update existing video element or create new one
+    const vidId = `video-${id}`;
+    let existing = document.getElementById(vidId);
+    if (existing) {
+      existing.srcObject = e.streams[0];
+      return;
+    }
+    const v = document.createElement('video');
+    v.id = vidId;
+    v.autoplay = true;
+    v.playsInline = true;
+    v.srcObject = e.streams[0];
+    v.className = 'remote-video';
+    const container = remoteVideosContainer();
+    if (container) container.appendChild(v);
+  };
+
+  pc.onicecandidate = (evt) => {
+    if (evt.candidate) {
+      ws.send(JSON.stringify({
+        type: 'ice_candidate',
+        candidate: evt.candidate,
+        targetClientId: id
+      }));
+    }
+  };
+
+  pc.onconnectionstatechange = () => {
+    console.log(`PC ${id} state:`, pc.connectionState, pc.iceConnectionState);
+    if (pc.connectionState === 'failed' || pc.iceConnectionState === 'failed') {
+      // Consider ICE restart or reconnect logic
+      console.warn('Peer connection failed for', id);
+    }
+  };
+
+  return pc;
 }
 
 async function createOffer(targetId) {
-  const pc = new RTCPeerConnection(pcConfig);
-  peers[targetId] = pc;
-
-  localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
-
-  pc.onicecandidate = (e) => {
-    if (e.candidate) {
-      ws.send(
-        JSON.stringify({
-          type: "candidate",
-          target: targetId,
-          candidate: e.candidate
-        })
-      );
-    }
-  };
-
-  pc.ontrack = (e) => {
-  // Prevent duplicate video elements for same peer
-  if (!document.getElementById(`video-${targetId}`)) {
-    const remoteVideo = document.createElement("video");
-    remoteVideo.id = `video-${targetId}`;
-    remoteVideo.srcObject = e.streams[0];
-    remoteVideo.autoplay = true;
-    remoteVideo.playsInline = true;
-    document.getElementById("remoteVideos").appendChild(remoteVideo);
+  const pc = createPeerConnectionFor(targetId);
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    ws.send(JSON.stringify({
+      type: 'offer',
+      sdp: pc.localDescription,
+      targetClientId: targetId
+    }));
+    console.log('Sent offer to', targetId);
+  } catch (err) {
+    console.error('createOffer error', err);
   }
-};
-
-
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  ws.send(JSON.stringify({ type: "offer", target: targetId, offer }));
 }
 
-async function handleOffer(data) {
-  const pc = new RTCPeerConnection(pcConfig);
-  peers[data.from] = pc;
-
-  localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
-
-  pc.onicecandidate = (e) => {
-    if (e.candidate) {
-      ws.send(
-        JSON.stringify({
-          type: "candidate",
-          target: data.from,
-          candidate: e.candidate
-        })
-      );
-    }
-  };
-
-  pc.ontrack = (e) => {
-  if (!document.getElementById(`video-${data.from}`)) {
-    const remoteVideo = document.createElement("video");
-    remoteVideo.id = `video-${data.from}`;
-    remoteVideo.srcObject = e.streams[0];
-    remoteVideo.autoplay = true;
-    remoteVideo.playsInline = true;
-    document.getElementById("remoteVideos").appendChild(remoteVideo);
+async function handleOfferFromPeer(fromId, sdp, fromUsername) {
+  const pc = createPeerConnectionFor(fromId);
+  try {
+    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    ws.send(JSON.stringify({
+      type: 'answer',
+      sdp: pc.localDescription,
+      targetClientId: fromId
+    }));
+    console.log('Sent answer to', fromId);
+  } catch (err) {
+    console.error('handleOffer error', err);
   }
-};
-
-
-  await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
-  ws.send(JSON.stringify({ type: "answer", target: data.from, answer }));
 }
 
-async function handleAnswer(data) {
-  await peers[data.from].setRemoteDescription(new RTCSessionDescription(data.answer));
+async function handleAnswerFromPeer(fromId, sdp) {
+  const pc = peers[fromId];
+  if (!pc) {
+    console.warn('Received answer for unknown peer', fromId);
+    return;
+  }
+  try {
+    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    console.log('Set remote description (answer) for', fromId);
+  } catch (err) {
+    console.error('handleAnswer error', err);
+  }
 }
 
-window.onload = init;
+function removePeerAndVideo(id) {
+  // remove video element
+  const el = document.getElementById(`video-${id}`);
+  if (el) el.remove();
+  // close pc
+  if (peers[id]) {
+    try { peers[id].close(); } catch (e) {}
+    delete peers[id];
+  }
+}
+
+// teardown local & peers
+function teardownLocalAndPeers() {
+  Object.keys(peers).forEach(pid => {
+    try { peers[pid].close(); } catch (e) {}
+    delete peers[pid];
+  });
+  if (localStream) {
+    for (const t of localStream.getTracks()) t.stop();
+    localStream = null;
+  }
+  const localEl = localVideoEl();
+  if (localEl) localEl.srcObject = null;
+  // remove remote videos
+  const container = remoteVideosContainer();
+  if (container) container.innerHTML = '';
+}
+
+// ======== Chat UI helper (minimal) ========
+function appendChatMessage(user, message, time, isLocal) {
+  const chatBox = document.getElementById('chatMessages');
+  if (!chatBox) return;
+  const div = document.createElement('div');
+  div.className = isLocal ? 'chat-msg local' : 'chat-msg remote';
+  div.innerHTML = `<strong>${user}</strong> <span class="ts">${time || ''}</span><div>${message}</div>`;
+  chatBox.appendChild(div);
+  chatBox.scrollTop = chatBox.scrollHeight;
+}
+
+// ======== Expose small helpers to HTML buttons ====
+window.createRoom = createRoom;
+window.joinRoomPrompt = joinRoomPrompt;
+window.endMeeting = endMeeting;
+window.teardown = teardownLocalAndPeers;
+
+// Also expose Google user for debug
+window._googleUser = () => googleUser;

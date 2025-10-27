@@ -2,19 +2,115 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>My Meet</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Meet Clone – Real-time Video Platform</title>
   <link rel="stylesheet" href="style.css" />
+  <!-- Google Sign-In SDK -->
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
-  <h1>My Meet</h1>
-  <div id="controls">
-    <button onclick="createRoom()">Create Room</button>
-    <button onclick="joinRoom()">Join Room</button>
-    <button onclick="endMeeting()">End Meeting</button>
-  </div>
-  <p id="roomDisplay"></p>
-  <video id="localVideo" autoplay playsinline muted></video>
-  <div id="remoteVideos"></div>
+  <header>
+    <h2>Meet Clone</h2>
+    <div id="authSection">
+      <div id="gSignInDiv"></div>
+      <p id="authStatus">Not signed in</p>
+    </div>
+  </header>
+
+  <main>
+    <!-- Room Display -->
+    <div id="roomDisplay">Room: Not connected</div>
+
+    <!-- Controls -->
+    <div id="controls">
+      <button id="createBtn" onclick="createRoom()">Create Room</button>
+      <button id="joinBtn" onclick="joinRoomPrompt()">Join Room</button>
+      <button id="endBtn" onclick="endMeeting()">End Meeting</button>
+      <button id="muteAllBtn">Mute All</button>
+      <button id="unmuteAllBtn">Unmute All</button>
+      <button id="toggleChatBtn">Chat</button>
+    </div>
+
+    <!-- Local Video -->
+    <video id="localVideo" autoplay muted playsinline></video>
+
+    <!-- Remote Videos -->
+    <div id="remoteVideos"></div>
+
+    <!-- Chat Sidebar -->
+    <div id="chatSidebar" class="hidden">
+      <div id="chatHeader">
+        <h3>Chat Room</h3>
+        <button id="closeChatBtn">X</button>
+      </div>
+      <div id="chatMessages"></div>
+      <input type="file" id="fileInput" />
+      <textarea id="chatInput" placeholder="Type a message..."></textarea>
+      <button id="sendChatBtn">Send</button>
+    </div>
+  </main>
+
+  <footer>
+    <p>Developed by Kanhaiya Aggarwal</p>
+  </footer>
+
   <script src="main.js"></script>
+  <script>
+    // Chat toggle logic
+    const chatSidebar = document.getElementById("chatSidebar");
+    const toggleChatBtn = document.getElementById("toggleChatBtn");
+    const closeChatBtn = document.getElementById("closeChatBtn");
+    const sendChatBtn = document.getElementById("sendChatBtn");
+    const chatInput = document.getElementById("chatInput");
+    const chatMessages = document.getElementById("chatMessages");
+    const fileInput = document.getElementById("fileInput");
+
+    toggleChatBtn.onclick = () => chatSidebar.classList.toggle("hidden");
+    closeChatBtn.onclick = () => chatSidebar.classList.add("hidden");
+
+    sendChatBtn.onclick = () => {
+      const msg = chatInput.value.trim();
+      if (!msg) return;
+      ws.send(JSON.stringify({ type: "chat_message", message: msg }));
+      chatInput.value = "";
+    };
+
+    fileInput.onchange = (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        ws.send(
+          JSON.stringify({
+            type: "chat_message",
+            message: `[File]: ${file.name}`,
+            fileData: reader.result
+          })
+        );
+      };
+      reader.readAsDataURL(file);
+    };
+
+    // Admin Mute buttons
+    document.getElementById("muteAllBtn").onclick = () => {
+      if (!isAdmin) return alert("Only admin can mute all participants.");
+      ws.send(JSON.stringify({ type: "admin_control", action: "mute_all", adminToken }));
+    };
+
+    document.getElementById("unmuteAllBtn").onclick = () => {
+      if (!isAdmin) return alert("Only admin can unmute all.");
+      Object.keys(peers).forEach((pid) => {
+        ws.send(
+          JSON.stringify({
+            type: "admin_control",
+            action: "mute_toggle",
+            targetClientId: pid,
+            muteState: false,
+            adminToken
+          })
+        );
+      });
+    };
+  </script>
 </body>
 </html>
