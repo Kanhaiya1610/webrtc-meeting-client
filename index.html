@@ -1,72 +1,20 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebRTC Meeting Room V2.1</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="style.css">
+  <meta charset="UTF-8" />
+  <title>My Meet</title>
+  <link rel="stylesheet" href="style.css" />
 </head>
-<body class="bg-gray-900 text-gray-100 overflow-hidden">
-
-    <!-- Landing Page -->
-    <div id="landing-page" class="min-h-screen flex items-center justify-center">
-        <div class="text-center bg-gray-800 p-8 rounded-lg shadow-xl">
-            <h1 class="text-4xl font-bold text-indigo-400 mb-8">WebRTC Meeting Room</h1>
-            <input id="usernameInput" type="text" placeholder="Enter your name..." class="w-full p-3 mb-4 bg-gray-700 rounded-lg text-center text-lg">
-            <button id="createRoomBtn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-6 rounded-lg text-lg mb-4">Create a New Room</button>
-            <div class="flex">
-                <input id="roomIdInput" type="text" placeholder="Enter Room ID" class="flex-grow p-3 bg-gray-700 rounded-l-lg text-center uppercase">
-                <button id="joinRoomBtn" class="bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-r-lg">Join Room</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- Meeting Room -->
-    <div id="meeting-room" class="hidden">
-        <div class="flex h-screen w-screen">
-            <!-- Main Content -->
-            <div class="flex-grow flex flex-col">
-                <div id="video-grid" class="flex-grow p-4"></div>
-                <!-- Bottom Control Bar -->
-                <div class="bg-black bg-opacity-50 p-2 flex justify-center items-center space-x-4">
-                    <button id="muteSelfBtn" class="control-btn bg-yellow-600 text-black">Mute</button>
-                    <button id="leaveMeetingBtn" class="control-btn bg-red-600">Leave</button>
-                    <button id="endMeetingBtn" class="control-btn bg-red-800 hidden">End for All</button>
-                    <button id="toggleParticipantsBtn" class="control-btn bg-gray-600">Participants</button>
-                    <button id="toggleChatBtn" class="control-btn bg-gray-600">Chat</button>
-                </div>
-            </div>
-            <!-- Side Panel -->
-            <div id="side-panel" class="w-80 bg-gray-950 flex-col p-4 transform translate-x-full fixed right-0 top-0 h-full">
-                <!-- Participants Panel -->
-                <div id="participants-panel" class="flex flex-col h-full">
-                    <h3 class="text-xl font-bold mb-4">Participants (<span id="participant-count">0</span>)</h3>
-                    <div id="participants-list" class="flex-grow space-y-2 overflow-y-auto"></div>
-                </div>
-                <!-- Chat Panel -->
-                <div id="chat-panel" class="hidden flex-col h-full">
-                    <h3 class="text-xl font-bold mb-4">Chat</h3>
-                    <div id="chat-messages" class="flex-grow bg-gray-800 rounded p-2 overflow-y-auto mb-2"></div>
-                    <textarea id="chat-input" placeholder="Type a message..." rows="3" class="w-full p-2 bg-gray-700 rounded resize-none"></textarea>
-                </div>
-            </div>
-        </div>
-    </div>
-    
-    <!-- Share Room ID Modal -->
-    <div id="share-modal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50">
-        <div class="bg-gray-800 p-8 rounded-lg shadow-xl text-center">
-            <h2 class="text-2xl font-bold text-indigo-400 mb-4">Room Created Successfully!</h2>
-            <p class="text-gray-300 mb-4">Share this Room ID with your participants:</p>
-            <div class="flex items-center justify-center bg-gray-900 p-4 rounded-lg">
-                <span id="modalRoomId" class="text-3xl font-mono text-green-400 mr-4"></span>
-                <button id="copyRoomIdBtn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">Copy</button>
-            </div>
-            <button id="closeModalBtn" class="mt-6 bg-gray-600 hover:bg-gray-700 text-white font-bold py-2 px-6 rounded">Close</button>
-        </div>
-    </div>
-    
-    <script src="main.js"></script>
+<body>
+  <h1>My Meet</h1>
+  <div id="controls">
+    <button onclick="createRoom()">Create Room</button>
+    <button onclick="joinRoom()">Join Room</button>
+    <button onclick="endMeeting()">End Meeting</button>
+  </div>
+  <p id="roomDisplay"></p>
+  <video id="localVideo" autoplay playsinline muted></video>
+  <div id="remoteVideos"></div>
+  <script src="main.js"></script>
 </body>
 </html>
