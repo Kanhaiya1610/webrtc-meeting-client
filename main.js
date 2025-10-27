@@ -913,7 +913,7 @@ let pcConfig = { iceServers: [] };
 
 async function getIceServers() {
   try {
-    const res = await fetch("wss://webrtc-meeting-server.onrender.com");
+    const res = await fetch("wss://webrtc-meeting-server.onrender.com/ice");
     const data = await res.json();
     pcConfig.iceServers = data.iceServers;
     console.log("ICE servers:", pcConfig.iceServers);
@@ -1033,12 +1033,17 @@ async function createOffer(targetId) {
   };
 
   pc.ontrack = (e) => {
+  // Prevent duplicate video elements for same peer
+  if (!document.getElementById(`video-${targetId}`)) {
     const remoteVideo = document.createElement("video");
+    remoteVideo.id = `video-${targetId}`;
     remoteVideo.srcObject = e.streams[0];
     remoteVideo.autoplay = true;
     remoteVideo.playsInline = true;
     document.getElementById("remoteVideos").appendChild(remoteVideo);
-  };
+  }
+};
+
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
@@ -1064,12 +1069,16 @@ async function handleOffer(data) {
   };
 
   pc.ontrack = (e) => {
+  if (!document.getElementById(`video-${data.from}`)) {
     const remoteVideo = document.createElement("video");
+    remoteVideo.id = `video-${data.from}`;
     remoteVideo.srcObject = e.streams[0];
     remoteVideo.autoplay = true;
     remoteVideo.playsInline = true;
     document.getElementById("remoteVideos").appendChild(remoteVideo);
-  };
+  }
+};
+
 
   await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
   const answer = await pc.createAnswer();
