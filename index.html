@@ -4,35 +4,18 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>Meet Clone – Real-time Video Platform</title>
-
-  <!-- Icons -->
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
-
-  <!-- Monomode-inspired Fonts -->
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-
-  <!-- New Stylesheet -->
   <link rel="stylesheet" href="style.css" />
-  
-  <!-- Google Sign-In -->
   <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
-
-  <!-- Loading Overlay (Inspired by Monomode) -->
-  <div class="c-loading">
-    <div class="c-loading__spinner"></div>
-  </div>
-
   <!-- Landing Page -->
   <div id="landingPage" class="landing-container">
     <div class="landing-content">
       <div class="logo-section">
-        <!-- Using the serif font for the main title -->
+        <i class="fas fa-video"></i>
         <h1>Meet Clone</h1>
-        <p>Clearer connections. Deeper collaboration.</p>
+        <p>Premium video meetings. Now free for everyone.</p>
       </div>
       
       <div class="auth-card">
@@ -56,6 +39,7 @@
             <div class="join-section">
               <input type="text" id="roomIdInput" placeholder="Enter meeting code" maxlength="8" />
               <button class="btn-secondary" onclick="joinRoomPrompt()">
+                <i class="fas fa-sign-in-alt"></i>
                 Join
               </button>
             </div>
@@ -69,9 +53,6 @@
   <div id="meetingRoom" class="meeting-room hidden">
     <!-- Header -->
     <header class="meeting-header">
-      <!-- Monomode-inspired Progress Bar (Decorative) -->
-      <div class="c-progress-bar"></div>
-
       <div class="header-left">
         <div class="room-info">
           <i class="fas fa-video"></i>
@@ -113,7 +94,7 @@
 
     <!-- Controls Bar -->
     <div class="controls-bar">
-      <div classs="controls-center">
+      <div class="controls-center">
         <button class="control-btn" id="toggleMicBtn" onclick="toggleMic()" title="Mute/Unmute">
           <i class="fas fa-microphone" id="micIcon"></i>
         </button>
@@ -200,8 +181,6 @@
   <!-- Toast Notifications -->
   <div id="toastContainer" class="toast-container"></div>
 
-  <!-- Your original, unchanged JS file -->
   <script src="main.js"></script>
 </body>
 </html>
-
