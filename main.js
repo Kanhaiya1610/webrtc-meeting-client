@@ -909,9 +909,25 @@
 const WS_URL = "wss://webrtc-meeting-server.onrender.com";      // <--- update to your Render URL
 const ICE_ENDPOINT = "https://webrtc-meeting-server.onrender.com/ice"; // <--- update to your Render URL
 const GOOGLE_CLIENT_ID = "173379398027-i3h11rufg14tpde9rhutp0uvt3imos3k.apps.googleusercontent.com";// <--- set this
+// ===== CONFIGURATION =====
+// ===== STATE =====
+let googleUser = null;
+let ws = null;
+let localStream = null;
+let clientId = null;
+let roomId = null;
+let isAdmin = false;
+let adminToken = null;
+let isMuted = false;
+let isCameraOff = false;
+let peers = {}; // { clientId: { pc, username } }
+let pcConfig = { iceServers: [] };
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
+let unreadMessages = 0;
+let isInMeeting = false;
 
-// ======== Auth state ========
-let googleUser = null; // { email, name }
+// ===== UTILITY FUNCTIONS =====
 function parseJwt(token) {
   const base64Url = token.split('.')[1];
   const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
@@ -921,383 +937,1032 @@ function parseJwt(token) {
   return JSON.parse(jsonPayload);
 }
 
-// ======== Signaling & WebRTC state ========
-let ws = null;
-let localStream = null;
-const peers = {}; // peers[clientId] = RTCPeerConnection
-let clientId = null;
-let roomId = null;
-let isAdmin = false;
-let adminToken = null;
-let pcConfig = { iceServers: [] };
+function showToast(message, type = 'info') {
+  const container = document.getElementById('toastContainer');
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+  toast.innerHTML = `
+    <i class="fas fa-${type === 'success' ? 'check-circle' : type === 'error' ? 'exclamation-circle' : 'info-circle'}"></i>
+    <span>${message}</span>
+  `;
+  container.appendChild(toast);
+  
+  setTimeout(() => {
+    toast.style.animation = 'fadeOut 0.3s ease-out';
+    setTimeout(() => toast.remove(), 300);
+  }, 3000);
+}
 
-// ======== UI helpers (expect these IDs to exist in index.html) ========
-const localVideoEl = () => document.getElementById('localVideo');
-const remoteVideosContainer = () => document.getElementById('remoteVideos');
-const roomDisplayEl = () => document.getElementById('roomDisplay');
-const authStatusEl = () => document.getElementById('authStatus');
-const gSignInDiv = () => document.getElementById('gSignInDiv');
+function showLoading(text = 'Connecting...') {
+  const overlay = document.getElementById('loadingOverlay');
+  const loadingText = document.getElementById('loadingText');
+  loadingText.textContent = text;
+  overlay.classList.remove('hidden');
+}
 
-// ======== Initialization ========
-async function loadIceServers() {
-  try {
-    const res = await fetch(ICE_ENDPOINT);
-    const data = await res.json();
-    pcConfig.iceServers = data.iceServers || [{ urls: 'stun:stun.l.google.com:19302' }];
-    console.log('Loaded ICE servers:', pcConfig.iceServers);
-  } catch (err) {
-    console.warn('Failed to fetch ICE servers, falling back to public STUN.', err);
-    pcConfig.iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
+function hideLoading() {
+  document.getElementById('loadingOverlay').classList.add('hidden');
+}
+
+function updateConnectionStatus(connected) {
+  const status = document.getElementById('connectionStatus');
+  const icon = status.querySelector('i');
+  const text = status.querySelector('span');
+  
+  if (connected) {
+    icon.style.color = 'var(--success-green)';
+    text.textContent = 'Connected';
+  } else {
+    icon.style.color = 'var(--danger-red)';
+    text.textContent = 'Reconnecting...';
   }
 }
 
+// ===== GOOGLE SIGN-IN =====
 function initGoogleSignIn() {
-  if (!window.google || !google.accounts || !google.accounts.id) {
-    console.warn('Google Identity SDK not loaded (script tag missing).');
+  if (!window.google?.accounts?.id) {
+    console.warn('Google Identity SDK not loaded');
     return;
   }
+  
   google.accounts.id.initialize({
     client_id: GOOGLE_CLIENT_ID,
     callback: handleCredentialResponse,
     auto_select: false
   });
-  google.accounts.id.renderButton(gSignInDiv(), { theme: 'outline', size: 'large' });
-  // optional auto prompt
-  // google.accounts.id.prompt();
+  
+  const signInDiv = document.getElementById('gSignInDiv');
+  if (signInDiv) {
+    google.accounts.id.renderButton(signInDiv, {
+      theme: 'outline',
+      size: 'large',
+      width: 400
+    });
+  }
 }
 
 function handleCredentialResponse(response) {
   try {
     const payload = parseJwt(response.credential);
-    googleUser = { email: payload.email, name: payload.name || payload.email.split('@')[0] };
+    googleUser = {
+      email: payload.email,
+      name: payload.name || payload.email.split('@')[0],
+      picture: payload.picture
+    };
+    
     console.log('Google signed in:', googleUser);
-    if (authStatusEl()) authStatusEl().innerText = `Signed in as ${googleUser.name}`;
-    if (gSignInDiv()) gSignInDiv().style.display = 'none';
+    
+    // Update UI
+    document.getElementById('authStatus').classList.add('hidden');
+    document.getElementById('gSignInDiv').style.display = 'none';
+    
+    const afterAuth = document.getElementById('afterAuth');
+    afterAuth.classList.remove('hidden');
+    
+    // Set user info
+    const avatar = document.getElementById('userAvatar');
+    avatar.textContent = googleUser.name.charAt(0).toUpperCase();
+    document.getElementById('userName').textContent = googleUser.name;
+    document.getElementById('userEmail').textContent = googleUser.email;
+    
+    showToast('Signed in successfully!', 'success');
   } catch (err) {
     console.error('Failed to parse Google credential', err);
+    showToast('Sign in failed. Please try again.', 'error');
   }
 }
 
-// initialize on DOM ready
-document.addEventListener('DOMContentLoaded', async () => {
-  // load ICE servers as soon as possible
-  await loadIceServers();
+// ===== ICE SERVER CONFIGURATION =====
+async function loadIceServers() {
+  try {
+    const res = await fetch(ICE_ENDPOINT);
+    const data = await res.json();
+    pcConfig.iceServers = data.iceServers || [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' }
+    ];
+    console.log('Loaded ICE servers:', pcConfig.iceServers);
+  } catch (err) {
+    console.warn('Failed to fetch ICE servers, using defaults', err);
+    pcConfig.iceServers = [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' }
+    ];
+  }
+}
 
-  // init Google sign-in widget (requires <script src="https://accounts.google.com/gsi/client"> in index.html)
-  try { initGoogleSignIn(); } catch (e) { console.warn('Google init error', e); }
-
-  // create websocket connection (but we only send create/join after sign in)
-  initWebSocket();
-});
-
-// ======== WebSocket setup ========
+// ===== WEBSOCKET CONNECTION =====
 function initWebSocket() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    console.log('WebSocket already connected');
+    return;
+  }
+  
   ws = new WebSocket(WS_URL);
+  
   ws.onopen = () => {
-    console.log('WebSocket connected to signaling server');
+    console.log('WebSocket connected');
+    updateConnectionStatus(true);
+    reconnectAttempts = 0;
   };
+  
   ws.onmessage = async (evt) => {
-    const data = JSON.parse(evt.data);
-    // console.log('WS in:', data);
-    switch (data.type) {
-      case 'your_info':
-        clientId = data.clientId;
-        // If server marks you admin, pick up token
-        isAdmin = !!data.isAdmin;
-        adminToken = data.adminToken || adminToken;
-        if (data.roomId) {
-          roomId = data.roomId;
-          if (roomDisplayEl()) roomDisplayEl().innerText = `Room: ${roomId}`;
-        }
-        console.log('your_info:', { clientId, isAdmin, adminToken, roomId });
-        break;
-
-      case 'room_created':
-        roomId = data.roomId;
-        if (roomDisplayEl()) roomDisplayEl().innerText = `Room: ${roomId}`;
-        alert(`Room created: ${roomId} — share this code`);
-        break;
-
-      case 'room_state':
-        // data.participants is array of existing participants (exclude self)
-        console.log('room_state received', data.participants);
-        // For each participant, create a peer connection as offerer
-        for (const p of data.participants) {
-          // p: { clientId, username, isMuted }
-          if (p.clientId === clientId) continue;
-          console.log('Creating offer to existing participant', p.clientId);
-          await ensureLocalStream(); // ensure we have local stream before offering
-          createOffer(p.clientId);
-        }
-        break;
-
-      case 'peer_joined':
-        // new peer joined the room (server excludes the newcomer)
-        console.log('peer_joined:', data.clientId);
-        // Only existing participants should create offer toward newcomer.
-        // If you are already in the room (roomId set), create an offer.
-        if (roomId && data.clientId !== clientId) {
-          await ensureLocalStream();
-          createOffer(data.clientId);
-        }
-        break;
-
-      case 'offer':
-        // payload forwarded from server includes: from (clientId), sdp
-        console.log('offer from', data.from);
-        await ensureLocalStream();
-        await handleOfferFromPeer(data.from, data.sdp, data.fromUsername);
-        break;
-
-      case 'answer':
-        console.log('answer from', data.from);
-        await handleAnswerFromPeer(data.from, data.sdp);
-        break;
-
-      case 'ice_candidate':
-        // data.from, data.candidate
-        if (peers[data.from]) {
-          try {
-            await peers[data.from].addIceCandidate(new RTCIceCandidate(data.candidate));
-            // console.log('Added remote ICE candidate from', data.from);
-          } catch (e) {
-            console.warn('Failed to add remote ICE candidate', e);
-          }
-        }
-        break;
-
-      case 'force_mute':
-        console.log('force_mute', data);
-        if (data.muteState && localStream) {
-          localStream.getAudioTracks().forEach(t => t.enabled = false);
-          alert('You were muted by the host');
-        }
-        break;
-
-      case 'new_chat_message':
-        // basic display integration, requires chat UI
-        console.log('chat:', data.fromUsername, data.message);
-        appendChatMessage(data.fromUsername, data.message, data.timestamp, data.fromClientId === clientId);
-        break;
-
-      case 'peer_left':
-        console.log('peer_left', data.clientId);
-        removePeerAndVideo(data.clientId);
-        break;
-
-      case 'meeting_ended':
-        alert('Meeting ended by host');
-        // cleanup
-        teardownLocalAndPeers();
-        location.reload();
-        break;
-
-      case 'error':
-        console.error('Server error:', data.message);
-        alert(`Server error: ${data.message}`);
-        break;
-
-      default:
-        console.warn('Unhandled WS msg type', data.type);
+    try {
+      const data = JSON.parse(evt.data);
+      await handleSignalingMessage(data);
+    } catch (err) {
+      console.error('Failed to parse message:', err);
     }
   };
-
+  
+  ws.onerror = (err) => {
+    console.error('WebSocket error:', err);
+    updateConnectionStatus(false);
+  };
+  
   ws.onclose = () => {
     console.log('WebSocket closed');
-  };
-
-  ws.onerror = (err) => {
-    console.error('WebSocket error', err);
+    updateConnectionStatus(false);
+    
+    if (isInMeeting && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+      reconnectAttempts++;
+      showToast(`Reconnecting... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`, 'info');
+      setTimeout(() => initWebSocket(), 2000 * reconnectAttempts);
+    }
   };
 }
 
-// ======== Helpers: local media ========
-async function ensureLocalStream() {
-  if (localStream) return;
+// ===== SIGNALING MESSAGE HANDLER =====
+async function handleSignalingMessage(data) {
+  console.log('Received:', data.type);
+  
+  switch (data.type) {
+    case 'your_info':
+      clientId = data.clientId;
+      isAdmin = !!data.isAdmin;
+      adminToken = data.adminToken || adminToken;
+      
+      if (data.roomId) {
+        roomId = data.roomId;
+        updateRoomDisplay();
+      }
+      
+      if (isAdmin) {
+        document.getElementById('endMeetingBtn').classList.remove('hidden');
+        document.getElementById('muteAllBtn').classList.remove('hidden');
+      }
+      break;
+      
+    case 'room_created':
+      roomId = data.roomId;
+      updateRoomDisplay();
+      showToast(`Room created: ${roomId}`, 'success');
+      break;
+      
+    case 'room_state':
+      // Existing participants in the room
+      for (const p of data.participants) {
+        if (p.clientId !== clientId) {
+          addParticipantToList(p.clientId, p.username);
+          await createOffer(p.clientId, p.username);
+        }
+      }
+      break;
+      
+    case 'peer_joined':
+      showToast(`${data.username} joined`, 'info');
+      addParticipantToList(data.clientId, data.username);
+      if (roomId) {
+        await createOffer(data.clientId, data.username);
+      }
+      break;
+      
+    case 'offer':
+      await handleOffer(data.from || data.fromId, data.fromUsername, data.sdp);
+      break;
+      
+    case 'answer':
+      await handleAnswer(data.from || data.fromId, data.sdp);
+      break;
+      
+    case 'ice_candidate':
+      await handleIceCandidate(data.from || data.fromId, data.candidate);
+      break;
+      
+    case 'force_mute':
+      if (data.targetClientId === clientId && data.muteState) {
+        isMuted = true;
+        if (localStream) {
+          localStream.getAudioTracks().forEach(t => t.enabled = false);
+        }
+        updateMicButton();
+        showToast('You were muted by the host', 'info');
+      }
+      break;
+      
+    case 'new_chat_message':
+      displayChatMessage(data.fromUsername, data.message, data.timestamp, data.fromClientId === clientId);
+      break;
+      
+    case 'peer_left':
+      removePeer(data.clientId);
+      showToast(`Participant left`, 'info');
+      break;
+      
+    case 'meeting_ended':
+      showToast('Meeting ended by host', 'info');
+      leaveMeeting();
+      break;
+      
+    case 'error':
+      console.error('Server error:', data.message);
+      showToast(data.message, 'error');
+      hideLoading();
+      break;
+      
+    default:
+      console.warn('Unknown message type:', data.type);
+  }
+}
+
+// ===== ROOM ACTIONS =====
+async function createRoom() {
+  if (!googleUser) {
+    showToast('Please sign in first', 'error');
+    return;
+  }
+  
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    showToast('Not connected to server', 'error');
+    return;
+  }
+  
+  showLoading('Creating room...');
+  
   try {
-    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    const el = localVideoEl();
-    if (el) {
-      el.srcObject = localStream;
-      el.autoplay = true;
-      el.muted = true; // mute local preview
-      el.playsInline = true;
-    }
+    await setupLocalStream();
+    
+    ws.send(JSON.stringify({
+      type: 'create_room',
+      username: googleUser.name,
+      identity: { email: googleUser.email }
+    }));
+    
+    setTimeout(() => {
+      if (roomId) {
+        showMeetingRoom();
+        hideLoading();
+      }
+    }, 1000);
   } catch (err) {
-    console.error('getUserMedia failed', err);
-    alert('Could not access camera/microphone. Please allow permissions.');
+    console.error('Failed to create room:', err);
+    showToast('Failed to create room', 'error');
+    hideLoading();
+  }
+}
+
+async function joinRoomPrompt() {
+  if (!googleUser) {
+    showToast('Please sign in first', 'error');
+    return;
+  }
+  
+  const input = document.getElementById('roomIdInput');
+  const id = input.value.trim().toUpperCase();
+  
+  if (!id) {
+    showToast('Please enter a room code', 'error');
+    return;
+  }
+  
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    showToast('Not connected to server', 'error');
+    return;
+  }
+  
+  showLoading(`Joining room ${id}...`);
+  
+  try {
+    await setupLocalStream();
+    
+    ws.send(JSON.stringify({
+      type: 'join_room',
+      roomId: id,
+      username: googleUser.name,
+      identity: { email: googleUser.email }
+    }));
+    
+    setTimeout(() => {
+      if (roomId) {
+        showMeetingRoom();
+        hideLoading();
+      }
+    }, 1000);
+  } catch (err) {
+    console.error('Failed to join room:', err);
+    showToast('Failed to join room', 'error');
+    hideLoading();
+  }
+}
+
+function updateRoomDisplay() {
+  const display = document.getElementById('roomDisplay');
+  if (display) {
+    display.innerHTML = `<i class="fas fa-video"></i> Room: ${roomId}`;
+  }
+}
+
+function copyRoomId() {
+  if (!roomId) return;
+  
+  navigator.clipboard.writeText(roomId).then(() => {
+    const btn = document.getElementById('copyRoomBtn');
+    const originalHTML = btn.innerHTML;
+    btn.innerHTML = '<i class="fas fa-check"></i> Copied!';
+    setTimeout(() => {
+      btn.innerHTML = originalHTML;
+    }, 2000);
+    showToast('Room code copied to clipboard', 'success');
+  }).catch(err => {
+    console.error('Failed to copy:', err);
+    showToast('Failed to copy room code', 'error');
+  });
+}
+
+// ===== LOCAL STREAM SETUP =====
+async function setupLocalStream() {
+  if (localStream) return;
+  
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        facingMode: 'user'
+      },
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
+    });
+    
+    addVideoElement(clientId, localStream, true, googleUser.name);
+    console.log('Local stream setup complete');
+  } catch (err) {
+    console.error('getUserMedia failed:', err);
+    showToast('Could not access camera/microphone', 'error');
     throw err;
   }
 }
 
-// ======== Room actions (create/join/end) ========
-async function createRoom() {
-  if (!googleUser) return alert('Please sign in with Google before creating a room.');
-  if (!ws || ws.readyState !== WebSocket.OPEN) return alert('Not connected to signaling server yet.');
-  await ensureLocalStream();
-  // send create_room with identity and username
-  ws.send(JSON.stringify({ type: 'create_room', username: googleUser.name, identity: { email: googleUser.email } }));
-}
-
-async function joinRoomPrompt() {
-  if (!googleUser) return alert('Please sign in with Google before joining.');
-  const id = prompt('Enter room ID:');
-  if (!id) return;
-  await ensureLocalStream();
-  ws.send(JSON.stringify({ type: 'join_room', roomId: id.toUpperCase(), username: googleUser.name, identity: { email: googleUser.email } }));
-}
-
-function endMeeting() {
-  if (!isAdmin) return alert('Only admin can end meeting.');
-  ws.send(JSON.stringify({ type: 'end_meeting', adminToken }));
-}
-
-// ======== Peer connection helpers ========
-function createPeerConnectionFor(id) {
-  if (peers[id]) {
-    return peers[id];
+// ===== VIDEO ELEMENT MANAGEMENT =====
+function addVideoElement(id, stream, isLocal = false, username = 'Participant') {
+  let wrapper = document.getElementById(`video-${id}`);
+  
+  if (!wrapper) {
+    wrapper = document.createElement('div');
+    wrapper.id = `video-${id}`;
+    wrapper.className = `video-wrapper ${isLocal ? 'local' : ''}`;
+    
+    const video = document.createElement('video');
+    video.autoplay = true;
+    video.playsInline = true;
+    video.muted = isLocal;
+    video.srcObject = stream;
+    
+    const overlay = document.createElement('div');
+    overlay.className = 'video-overlay';
+    overlay.innerHTML = `
+      <div class="participant-name">${isLocal ? 'You' : username}</div>
+      <div class="video-indicators">
+        <div class="indicator muted hidden" id="muted-${id}">
+          <i class="fas fa-microphone-slash"></i>
+        </div>
+      </div>
+    `;
+    
+    wrapper.appendChild(video);
+    wrapper.appendChild(overlay);
+    
+    document.getElementById('videoGrid').appendChild(wrapper);
+  } else {
+    const video = wrapper.querySelector('video');
+    video.srcObject = stream;
   }
-  const pc = new RTCPeerConnection(pcConfig);
-  peers[id] = pc;
+  
+  updateVideoGrid();
+}
 
-  // add local tracks
+function updateVideoGrid() {
+  const grid = document.getElementById('videoGrid');
+  const count = grid.children.length;
+  grid.setAttribute('data-count', count);
+}
+
+function removeVideoElement(id) {
+  const wrapper = document.getElementById(`video-${id}`);
+  if (wrapper) {
+    wrapper.remove();
+    updateVideoGrid();
+  }
+}
+
+// ===== WEBRTC PEER CONNECTION =====
+function createPeerConnection(id, username) {
+  if (peers[id]) {
+    return peers[id].pc;
+  }
+  
+  const pc = new RTCPeerConnection(pcConfig);
+  peers[id] = { pc, username };
+  
+  // Add local tracks
   if (localStream) {
     for (const track of localStream.getTracks()) {
-      try { pc.addTrack(track, localStream); } catch (e) { console.warn('addTrack failed', e); }
+      try {
+        pc.addTrack(track, localStream);
+      } catch (e) {
+        console.warn('Failed to add track:', e);
+      }
     }
   }
-
-  // remote track handling
-  pc.ontrack = (e) => {
-    // Update existing video element or create new one
-    const vidId = `video-${id}`;
-    let existing = document.getElementById(vidId);
-    if (existing) {
-      existing.srcObject = e.streams[0];
-      return;
+  
+  // Handle incoming tracks
+  pc.ontrack = (event) => {
+    console.log('Received track from', id);
+    if (event.streams && event.streams[0]) {
+      addVideoElement(id, event.streams[0], false, username);
     }
-    const v = document.createElement('video');
-    v.id = vidId;
-    v.autoplay = true;
-    v.playsInline = true;
-    v.srcObject = e.streams[0];
-    v.className = 'remote-video';
-    const container = remoteVideosContainer();
-    if (container) container.appendChild(v);
   };
-
-  pc.onicecandidate = (evt) => {
-    if (evt.candidate) {
-      ws.send(JSON.stringify({
+  
+  // Handle ICE candidates
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      sendSignalingMessage({
         type: 'ice_candidate',
-        candidate: evt.candidate,
+        candidate: event.candidate,
         targetClientId: id
-      }));
+      });
     }
   };
-
+  
+  // Handle connection state
+  pc.oniceconnectionstatechange = () => {
+    console.log(`ICE connection state for ${id}:`, pc.iceConnectionState);
+    
+    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+      showToast(`Connected to ${username}`, 'success');
+    } else if (pc.iceConnectionState === 'failed') {
+      console.error('Connection failed for', id);
+      // Attempt ICE restart
+      if (pc.restartIce) {
+        pc.restartIce();
+      }
+    }
+  };
+  
   pc.onconnectionstatechange = () => {
-    console.log(`PC ${id} state:`, pc.connectionState, pc.iceConnectionState);
-    if (pc.connectionState === 'failed' || pc.iceConnectionState === 'failed') {
-      // Consider ICE restart or reconnect logic
-      console.warn('Peer connection failed for', id);
-    }
+    console.log(`Connection state for ${id}:`, pc.connectionState);
   };
-
+  
   return pc;
 }
 
-async function createOffer(targetId) {
-  const pc = createPeerConnectionFor(targetId);
+async function createOffer(targetId, targetUsername) {
+  const pc = createPeerConnection(targetId, targetUsername);
+  
   try {
-    const offer = await pc.createOffer();
+    const offer = await pc.createOffer({
+      offerToReceiveAudio: true,
+      offerToReceiveVideo: true
+    });
+    
     await pc.setLocalDescription(offer);
-    ws.send(JSON.stringify({
+    
+    sendSignalingMessage({
       type: 'offer',
       sdp: pc.localDescription,
       targetClientId: targetId
-    }));
+    });
+    
     console.log('Sent offer to', targetId);
   } catch (err) {
-    console.error('createOffer error', err);
+    console.error('Failed to create offer:', err);
   }
 }
 
-async function handleOfferFromPeer(fromId, sdp, fromUsername) {
-  const pc = createPeerConnectionFor(fromId);
+async function handleOffer(fromId, fromUsername, sdp) {
+  const pc = createPeerConnection(fromId, fromUsername);
+  
   try {
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-    ws.send(JSON.stringify({
+    
+    sendSignalingMessage({
       type: 'answer',
       sdp: pc.localDescription,
       targetClientId: fromId
-    }));
+    });
+    
     console.log('Sent answer to', fromId);
   } catch (err) {
-    console.error('handleOffer error', err);
+    console.error('Failed to handle offer:', err);
   }
 }
 
-async function handleAnswerFromPeer(fromId, sdp) {
-  const pc = peers[fromId];
-  if (!pc) {
-    console.warn('Received answer for unknown peer', fromId);
+async function handleAnswer(fromId, sdp) {
+  const peer = peers[fromId];
+  if (!peer) {
+    console.warn('Received answer from unknown peer:', fromId);
     return;
   }
+  
   try {
-    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-    console.log('Set remote description (answer) for', fromId);
+    await peer.pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    console.log('Set remote description for', fromId);
   } catch (err) {
-    console.error('handleAnswer error', err);
+    console.error('Failed to set remote description:', err);
   }
 }
 
-function removePeerAndVideo(id) {
-  // remove video element
-  const el = document.getElementById(`video-${id}`);
-  if (el) el.remove();
-  // close pc
+async function handleIceCandidate(fromId, candidate) {
+  const peer = peers[fromId];
+  if (!peer) {
+    console.warn('Received ICE candidate from unknown peer:', fromId);
+    return;
+  }
+  
+  try {
+    await peer.pc.addIceCandidate(new RTCIceCandidate(candidate));
+  } catch (err) {
+    console.error('Failed to add ICE candidate:', err);
+  }
+}
+
+// ===== MEDIA CONTROLS =====
+function toggleMic() {
+  if (!localStream) return;
+  
+  isMuted = !isMuted;
+  localStream.getAudioTracks().forEach(track => {
+    track.enabled = !isMuted;
+  });
+  
+  updateMicButton();
+  showToast(isMuted ? 'Microphone muted' : 'Microphone unmuted', 'info');
+}
+
+function updateMicButton() {
+  const btn = document.getElementById('toggleMicBtn');
+  const icon = document.getElementById('micIcon');
+  
+  if (isMuted) {
+    icon.className = 'fas fa-microphone-slash';
+    btn.classList.add('active');
+  } else {
+    icon.className = 'fas fa-microphone';
+    btn.classList.remove('active');
+  }
+}
+
+function toggleCamera() {
+  if (!localStream) return;
+  
+  isCameraOff = !isCameraOff;
+  localStream.getVideoTracks().forEach(track => {
+    track.enabled = !isCameraOff;
+  });
+  
+  updateCameraButton();
+  showToast(isCameraOff ? 'Camera off' : 'Camera on', 'info');
+}
+
+function updateCameraButton() {
+  const btn = document.getElementById('toggleCamBtn');
+  const icon = document.getElementById('camIcon');
+  
+  if (isCameraOff) {
+    icon.className = 'fas fa-video-slash';
+    btn.classList.add('active');
+  } else {
+    icon.className = 'fas fa-video';
+    btn.classList.remove('active');
+  }
+}
+
+// ===== PARTICIPANTS PANEL =====
+function addParticipantToList(id, username) {
+  const list = document.getElementById('participantsList');
+  
+  let item = document.getElementById(`participant-${id}`);
+  if (!item) {
+    item = document.createElement('div');
+    item.id = `participant-${id}`;
+    item.className = 'participant-item';
+    
+    const initial = username.charAt(0).toUpperCase();
+    
+    item.innerHTML = `
+      <div class="participant-info">
+        <div class="participant-avatar">${initial}</div>
+        <div class="participant-details">
+          <p>${username}</p>
+          <span>${id === clientId ? 'You' : 'Participant'}</span>
+        </div>
+      </div>
+      ${isAdmin && id !== clientId ? `
+        <div class="participant-controls">
+          <button class="btn-icon" onclick="toggleParticipantMute('${id}')" title="Mute/Unmute">
+            <i class="fas fa-microphone"></i>
+          </button>
+        </div>
+      ` : ''}
+    `;
+    
+    list.appendChild(item);
+  }
+  
+  updateParticipantCount();
+}
+
+function removeParticipantFromList(id) {
+  const item = document.getElementById(`participant-${id}`);
+  if (item) {
+    item.remove();
+    updateParticipantCount();
+  }
+}
+
+function updateParticipantCount() {
+  const list = document.getElementById('participantsList');
+  const count = list.children.length;
+  
+  document.getElementById('participantCount').textContent = count;
+  document.getElementById('participantCountBadge').textContent = count;
+}
+
+// ===== ADMIN CONTROLS =====
+function toggleParticipantMute(targetId) {
+  if (!isAdmin) return;
+  
+  sendSignalingMessage({
+    type: 'admin_control',
+    action: 'mute_toggle',
+    targetClientId: targetId,
+    muteState: true,
+    adminToken
+  });
+}
+
+function muteAll() {
+  if (!isAdmin) return;
+  
+  if (confirm('Mute all participants?')) {
+    sendSignalingMessage({
+      type: 'admin_control',
+      action: 'mute_all',
+      adminToken
+    });
+    showToast('All participants muted', 'success');
+  }
+}
+
+function endMeeting() {
+  if (!isAdmin) return;
+  
+  if (confirm('End meeting for everyone?')) {
+    sendSignalingMessage({
+      type: 'end_meeting',
+      adminToken
+    });
+  }
+}
+
+// ===== CHAT =====
+function sendChatMessage() {
+  const input = document.getElementById('chatInput');
+  const message = input.value.trim();
+  
+  if (!message) return;
+  
+  sendSignalingMessage({
+    type: 'chat_message',
+    message
+  });
+  
+  input.value = '';
+  input.style.height = 'auto';
+}
+
+function displayChatMessage(username, message, timestamp, isLocal) {
+  const container = document.getElementById('chatMessages');
+  
+  const msgDiv = document.createElement('div');
+  msgDiv.className = `chat-message ${isLocal ? 'local' : 'remote'}`;
+  
+  msgDiv.innerHTML = `
+    <div class="message-sender">${isLocal ? 'You' : username}</div>
+    <div class="message-bubble">${escapeHtml(message)}</div>
+    <div class="message-time">${timestamp || formatTime(new Date())}</div>
+  `;
+  
+  container.appendChild(msgDiv);
+  container.scrollTop = container.scrollHeight;
+  
+  // Update unread badge if chat is closed
+  const panel = document.getElementById('sidePanel');
+  const chatPanel = document.getElementById('chatPanel');
+  
+  if (!panel.classList.contains('open') || chatPanel.classList.contains('hidden')) {
+    if (!isLocal) {
+      unreadMessages++;
+      updateChatBadge();
+    }
+  }
+}
+
+function updateChatBadge() {
+  const badge = document.getElementById('chatNotificationBadge');
+  if (unreadMessages > 0) {
+    badge.textContent = unreadMessages;
+    badge.classList.remove('hidden');
+  } else {
+    badge.classList.add('hidden');
+  }
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function formatTime(date) {
+  return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
+// Auto-resize chat input
+document.addEventListener('DOMContentLoaded', () => {
+  const chatInput = document.getElementById('chatInput');
+  if (chatInput) {
+    chatInput.addEventListener('input', function() {
+      this.style.height = 'auto';
+      this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+    });
+    
+    chatInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendChatMessage();
+      }
+    });
+  }
+});
+
+// ===== SIDE PANEL MANAGEMENT =====
+function toggleSidePanel(tab) {
+  const panel = document.getElementById('sidePanel');
+  const isOpen = panel.classList.contains('open');
+  
+  if (isOpen) {
+    const currentTab = document.querySelector('.tab-btn.active').id.replace('Tab', '');
+    if (currentTab === tab) {
+      closeSidePanel();
+      return;
+    }
+  }
+  
+  showPanelTab(tab);
+  panel.classList.add('open');
+  
+  if (tab === 'chat') {
+    unreadMessages = 0;
+    updateChatBadge();
+  }
+}
+
+function closeSidePanel() {
+  document.getElementById('sidePanel').classList.remove('open');
+}
+
+function showPanelTab(tab) {
+  // Update tabs
+  document.getElementById('participantsTab').classList.toggle('active', tab === 'participants');
+  document.getElementById('chatTab').classList.toggle('active', tab === 'chat');
+  
+  // Update panels
+  document.getElementById('participantsPanel').classList.toggle('hidden', tab !== 'participants');
+  document.getElementById('chatPanel').classList.toggle('hidden', tab !== 'chat');
+  
+  if (tab === 'chat') {
+    unreadMessages = 0;
+    updateChatBadge();
+    
+    // Scroll to bottom of chat
+    const chatMessages = document.getElementById('chatMessages');
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
+}
+
+// ===== UI TRANSITIONS =====
+function showMeetingRoom() {
+  document.getElementById('landingPage').classList.add('hidden');
+  document.getElementById('meetingRoom').classList.remove('hidden');
+  isInMeeting = true;
+  
+  // Add self to participants list
+  if (clientId && googleUser) {
+    addParticipantToList(clientId, googleUser.name);
+  }
+}
+
+function showLandingPage() {
+  document.getElementById('meetingRoom').classList.add('hidden');
+  document.getElementById('landingPage').classList.remove('hidden');
+  isInMeeting = false;
+}
+
+// ===== CLEANUP & LEAVE =====
+function removePeer(id) {
+  console.log('Removing peer:', id);
+  
+  // Close peer connection
   if (peers[id]) {
-    try { peers[id].close(); } catch (e) {}
+    try {
+      peers[id].pc.close();
+    } catch (e) {
+      console.error('Error closing peer connection:', e);
+    }
     delete peers[id];
   }
+  
+  // Remove video element
+  removeVideoElement(id);
+  
+  // Remove from participants list
+  removeParticipantFromList(id);
 }
 
-// teardown local & peers
-function teardownLocalAndPeers() {
-  Object.keys(peers).forEach(pid => {
-    try { peers[pid].close(); } catch (e) {}
-    delete peers[pid];
+function leaveMeeting() {
+  if (!confirm('Leave the meeting?')) return;
+  
+  // Close all peer connections
+  Object.keys(peers).forEach(id => {
+    try {
+      peers[id].pc.close();
+    } catch (e) {
+      console.error('Error closing peer:', e);
+    }
   });
+  peers = {};
+  
+  // Stop local media tracks
   if (localStream) {
-    for (const t of localStream.getTracks()) t.stop();
+    localStream.getTracks().forEach(track => {
+      try {
+        track.stop();
+      } catch (e) {
+        console.error('Error stopping track:', e);
+      }
+    });
     localStream = null;
   }
-  const localEl = localVideoEl();
-  if (localEl) localEl.srcObject = null;
-  // remove remote videos
-  const container = remoteVideosContainer();
-  if (container) container.innerHTML = '';
+  
+  // Clear video grid
+  const videoGrid = document.getElementById('videoGrid');
+  if (videoGrid) {
+    videoGrid.innerHTML = '';
+  }
+  
+  // Clear participants list
+  const participantsList = document.getElementById('participantsList');
+  if (participantsList) {
+    participantsList.innerHTML = '';
+  }
+  
+  // Clear chat
+  const chatMessages = document.getElementById('chatMessages');
+  if (chatMessages) {
+    chatMessages.innerHTML = '';
+  }
+  
+  // Reset state
+  clientId = null;
+  roomId = null;
+  isAdmin = false;
+  adminToken = null;
+  isMuted = false;
+  isCameraOff = false;
+  unreadMessages = 0;
+  isInMeeting = false;
+  
+  // Close WebSocket
+  if (ws) {
+    try {
+      ws.close();
+    } catch (e) {
+      console.error('Error closing WebSocket:', e);
+    }
+    ws = null;
+  }
+  
+  // Return to landing page
+  showLandingPage();
+  showToast('Left the meeting', 'info');
+  
+  // Reconnect WebSocket for next meeting
+  setTimeout(() => {
+    initWebSocket();
+  }, 1000);
 }
 
-// ======== Chat UI helper (minimal) ========
-function appendChatMessage(user, message, time, isLocal) {
-  const chatBox = document.getElementById('chatMessages');
-  if (!chatBox) return;
-  const div = document.createElement('div');
-  div.className = isLocal ? 'chat-msg local' : 'chat-msg remote';
-  div.innerHTML = `<strong>${user}</strong> <span class="ts">${time || ''}</span><div>${message}</div>`;
-  chatBox.appendChild(div);
-  chatBox.scrollTop = chatBox.scrollHeight;
+// ===== HELPER: SEND SIGNALING MESSAGE =====
+function sendSignalingMessage(message) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(message));
+  } else {
+    console.error('WebSocket not connected');
+    showToast('Connection lost. Please refresh.', 'error');
+  }
 }
 
-// ======== Expose small helpers to HTML buttons ====
+// ===== INITIALIZATION =====
+document.addEventListener('DOMContentLoaded', async () => {
+  console.log('Initializing app...');
+  
+  // Load ICE servers
+  await loadIceServers();
+  
+  // Initialize Google Sign-In
+  try {
+    initGoogleSignIn();
+  } catch (e) {
+    console.warn('Google Sign-In initialization failed:', e);
+  }
+  
+  // Connect to signaling server
+  initWebSocket();
+  
+  // Handle Enter key on room input
+  const roomInput = document.getElementById('roomIdInput');
+  if (roomInput) {
+    roomInput.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        joinRoomPrompt();
+      }
+    });
+    
+    // Auto-uppercase room code
+    roomInput.addEventListener('input', (e) => {
+      e.target.value = e.target.value.toUpperCase();
+    });
+  }
+  
+  // Close side panel on Escape key
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      const panel = document.getElementById('sidePanel');
+      if (panel.classList.contains('open')) {
+        closeSidePanel();
+      }
+    }
+  });
+  
+  // Prevent accidental page reload
+  window.addEventListener('beforeunload', (e) => {
+    if (isInMeeting) {
+      e.preventDefault();
+      e.returnValue = '';
+      return '';
+    }
+  });
+  
+  // Handle visibility change for quality optimization
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      console.log('Page hidden - could reduce quality');
+    } else {
+      console.log('Page visible - restore quality');
+    }
+  });
+  
+  console.log('App initialized successfully');
+});
+
+// ===== EXPOSE FUNCTIONS TO WINDOW =====
 window.createRoom = createRoom;
 window.joinRoomPrompt = joinRoomPrompt;
+window.copyRoomId = copyRoomId;
+window.toggleMic = toggleMic;
+window.toggleCamera = toggleCamera;
+window.leaveMeeting = leaveMeeting;
 window.endMeeting = endMeeting;
-window.teardown = teardownLocalAndPeers;
-
-// Also expose Google user for debug
-window._googleUser = () => googleUser;
+window.toggleSidePanel = toggleSidePanel;
+window.closeSidePanel = closeSidePanel;
+window.showPanelTab = showPanelTab;
+window.sendChatMessage = sendChatMessage;
+window.toggleParticipantMute = toggleParticipantMute;
+window.muteAll = muteAll;

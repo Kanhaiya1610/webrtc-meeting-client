@@ -2,115 +2,178 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>Meet Clone – Real-time Video Platform</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
   <link rel="stylesheet" href="style.css" />
-  <!-- Google Sign-In SDK -->
   <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
-  <header>
-    <h2>Meet Clone</h2>
-    <div id="authSection">
-      <div id="gSignInDiv"></div>
-      <p id="authStatus">Not signed in</p>
-    </div>
-  </header>
-
-  <main>
-    <!-- Room Display -->
-    <div id="roomDisplay">Room: Not connected</div>
-
-    <!-- Controls -->
-    <div id="controls">
-      <button id="createBtn" onclick="createRoom()">Create Room</button>
-      <button id="joinBtn" onclick="joinRoomPrompt()">Join Room</button>
-      <button id="endBtn" onclick="endMeeting()">End Meeting</button>
-      <button id="muteAllBtn">Mute All</button>
-      <button id="unmuteAllBtn">Unmute All</button>
-      <button id="toggleChatBtn">Chat</button>
-    </div>
-
-    <!-- Local Video -->
-    <video id="localVideo" autoplay muted playsinline></video>
-
-    <!-- Remote Videos -->
-    <div id="remoteVideos"></div>
-
-    <!-- Chat Sidebar -->
-    <div id="chatSidebar" class="hidden">
-      <div id="chatHeader">
-        <h3>Chat Room</h3>
-        <button id="closeChatBtn">X</button>
+  <!-- Landing Page -->
+  <div id="landingPage" class="landing-container">
+    <div class="landing-content">
+      <div class="logo-section">
+        <i class="fas fa-video"></i>
+        <h1>Meet Clone</h1>
+        <p>Premium video meetings. Now free for everyone.</p>
       </div>
-      <div id="chatMessages"></div>
-      <input type="file" id="fileInput" />
-      <textarea id="chatInput" placeholder="Type a message..."></textarea>
-      <button id="sendChatBtn">Send</button>
+      
+      <div class="auth-card">
+        <div id="gSignInDiv" class="google-signin"></div>
+        <p id="authStatus" class="auth-status">Sign in to continue</p>
+        
+        <div id="afterAuth" class="after-auth hidden">
+          <div class="user-info">
+            <div class="avatar" id="userAvatar"></div>
+            <div class="user-details">
+              <p class="user-name" id="userName"></p>
+              <p class="user-email" id="userEmail"></p>
+            </div>
+          </div>
+          
+          <div class="action-buttons">
+            <button class="btn-primary" onclick="createRoom()">
+              <i class="fas fa-video"></i>
+              New Meeting
+            </button>
+            <div class="join-section">
+              <input type="text" id="roomIdInput" placeholder="Enter meeting code" maxlength="8" />
+              <button class="btn-secondary" onclick="joinRoomPrompt()">
+                <i class="fas fa-sign-in-alt"></i>
+                Join
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
-  </main>
+  </div>
 
-  <footer>
-    <p>Developed by Kanhaiya Aggarwal</p>
-  </footer>
+  <!-- Meeting Room -->
+  <div id="meetingRoom" class="meeting-room hidden">
+    <!-- Header -->
+    <header class="meeting-header">
+      <div class="header-left">
+        <div class="room-info">
+          <i class="fas fa-video"></i>
+          <span id="roomDisplay">Room: Not connected</span>
+        </div>
+        <button class="btn-copy" id="copyRoomBtn" onclick="copyRoomId()">
+          <i class="fas fa-copy"></i>
+          Copy code
+        </button>
+      </div>
+      
+      <div class="header-right">
+        <div class="connection-status" id="connectionStatus">
+          <i class="fas fa-circle"></i>
+          <span>Connected</span>
+        </div>
+        <div class="participant-count" onclick="toggleSidePanel('participants')">
+          <i class="fas fa-users"></i>
+          <span id="participantCountBadge">1</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Video Grid -->
+    <div class="video-container">
+      <div id="videoGrid" class="video-grid">
+        <!-- Videos will be added here dynamically -->
+      </div>
+      
+      <!-- Connection Quality Indicator -->
+      <div id="qualityIndicator" class="quality-indicator hidden">
+        <i class="fas fa-signal"></i>
+        <span>Checking connection quality...</span>
+      </div>
+    </div>
+
+    <!-- Controls Bar -->
+    <div class="controls-bar">
+      <div class="controls-center">
+        <button class="control-btn" id="toggleMicBtn" onclick="toggleMic()" title="Mute/Unmute">
+          <i class="fas fa-microphone" id="micIcon"></i>
+        </button>
+        
+        <button class="control-btn" id="toggleCamBtn" onclick="toggleCamera()" title="Camera On/Off">
+          <i class="fas fa-video" id="camIcon"></i>
+        </button>
+        
+        <button class="control-btn btn-danger" onclick="leaveMeeting()" title="Leave Meeting">
+          <i class="fas fa-phone-slash"></i>
+        </button>
+        
+        <button class="control-btn" onclick="toggleSidePanel('chat')" title="Chat">
+          <i class="fas fa-comment"></i>
+          <span class="notification-badge hidden" id="chatNotificationBadge">0</span>
+        </button>
+        
+        <button class="control-btn" onclick="toggleSidePanel('participants')" title="Participants">
+          <i class="fas fa-users"></i>
+        </button>
+        
+        <button class="control-btn hidden" id="endMeetingBtn" onclick="endMeeting()" title="End Meeting for All">
+          <i class="fas fa-stop-circle"></i>
+        </button>
+      </div>
+    </div>
+
+    <!-- Side Panel -->
+    <div id="sidePanel" class="side-panel">
+      <div class="panel-header">
+        <div class="panel-tabs">
+          <button class="tab-btn active" id="participantsTab" onclick="showPanelTab('participants')">
+            <i class="fas fa-users"></i>
+            Participants
+          </button>
+          <button class="tab-btn" id="chatTab" onclick="showPanelTab('chat')">
+            <i class="fas fa-comment"></i>
+            Chat
+          </button>
+        </div>
+        <button class="close-panel" onclick="closeSidePanel()">
+          <i class="fas fa-times"></i>
+        </button>
+      </div>
+
+      <!-- Participants Panel -->
+      <div id="participantsPanel" class="panel-content">
+        <div class="participants-header">
+          <h3>In this meeting (<span id="participantCount">1</span>)</h3>
+          <button class="btn-icon hidden" id="muteAllBtn" onclick="muteAll()" title="Mute All">
+            <i class="fas fa-microphone-slash"></i>
+          </button>
+        </div>
+        <div id="participantsList" class="participants-list">
+          <!-- Participants will be listed here -->
+        </div>
+      </div>
+
+      <!-- Chat Panel -->
+      <div id="chatPanel" class="panel-content hidden">
+        <div id="chatMessages" class="chat-messages">
+          <!-- Chat messages will appear here -->
+        </div>
+        <div class="chat-input-container">
+          <textarea id="chatInput" placeholder="Send a message..." rows="1"></textarea>
+          <button class="send-btn" onclick="sendChatMessage()">
+            <i class="fas fa-paper-plane"></i>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Loading Overlay -->
+  <div id="loadingOverlay" class="loading-overlay hidden">
+    <div class="loading-spinner"></div>
+    <p id="loadingText">Connecting...</p>
+  </div>
+
+  <!-- Toast Notifications -->
+  <div id="toastContainer" class="toast-container"></div>
 
   <script src="main.js"></script>
-  <script>
-    // Chat toggle logic
-    const chatSidebar = document.getElementById("chatSidebar");
-    const toggleChatBtn = document.getElementById("toggleChatBtn");
-    const closeChatBtn = document.getElementById("closeChatBtn");
-    const sendChatBtn = document.getElementById("sendChatBtn");
-    const chatInput = document.getElementById("chatInput");
-    const chatMessages = document.getElementById("chatMessages");
-    const fileInput = document.getElementById("fileInput");
-
-    toggleChatBtn.onclick = () => chatSidebar.classList.toggle("hidden");
-    closeChatBtn.onclick = () => chatSidebar.classList.add("hidden");
-
-    sendChatBtn.onclick = () => {
-      const msg = chatInput.value.trim();
-      if (!msg) return;
-      ws.send(JSON.stringify({ type: "chat_message", message: msg }));
-      chatInput.value = "";
-    };
-
-    fileInput.onchange = (e) => {
-      const file = e.target.files[0];
-      if (!file) return;
-      const reader = new FileReader();
-      reader.onload = () => {
-        ws.send(
-          JSON.stringify({
-            type: "chat_message",
-            message: `[File]: ${file.name}`,
-            fileData: reader.result
-          })
-        );
-      };
-      reader.readAsDataURL(file);
-    };
-
-    // Admin Mute buttons
-    document.getElementById("muteAllBtn").onclick = () => {
-      if (!isAdmin) return alert("Only admin can mute all participants.");
-      ws.send(JSON.stringify({ type: "admin_control", action: "mute_all", adminToken }));
-    };
-
-    document.getElementById("unmuteAllBtn").onclick = () => {
-      if (!isAdmin) return alert("Only admin can unmute all.");
-      Object.keys(peers).forEach((pid) => {
-        ws.send(
-          JSON.stringify({
-            type: "admin_control",
-            action: "mute_toggle",
-            targetClientId: pid,
-            muteState: false,
-            adminToken
-          })
-        );
-      });
-    };
-  </script>
 </body>
 </html>
