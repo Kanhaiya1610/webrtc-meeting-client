@@ -902,13 +902,15 @@
 // // --- START ---
 // document.addEventListener('DOMContentLoaded', init);
 
-
+// frontend/main.js - Enhanced with Professional Meeting Features
+// Features: Raise Hand, Unmute Requests, Selective Unmute, Admin Transfer
 // frontend/main.js - Enhanced with robust WebRTC connectivity
 
 // ======== Configuration ========
 const WS_URL = "wss://webrtc-meeting-server.onrender.com";      // <--- update to your Render URL
 const ICE_ENDPOINT = "https://webrtc-meeting-server.onrender.com/ice"; // <--- update to your Render URL
 const GOOGLE_CLIENT_ID = "173379398027-i3h11rufg14tpde9rhutp0uvt3imos3k.apps.googleusercontent.com";// <--- set this
+
 
 // ===== STATE =====
 let googleUser = null;
@@ -919,8 +921,11 @@ let roomId = null;
 let isAdmin = false;
 let adminToken = null;
 let isMuted = false;
+let isAdminMuted = false;
 let isCameraOff = false;
-let peers = {}; // { clientId: { pc, username, iceCandidateQueue } }
+let handRaised = false;
+let peers = {};
+let participantsState = new Map();
 let pcConfig = { 
   iceServers: [],
   iceCandidatePoolSize: 10,
@@ -1063,9 +1068,7 @@ async function loadIceServers() {
     pcConfig.iceCandidatePoolSize = data.iceCandidatePoolSize || 10;
     
     console.log('✅ ICE servers loaded:', pcConfig.iceServers.length, 'servers');
-    console.log('🎯 ICE Transport Policy:', pcConfig.iceTransportPolicy);
     
-    // Log TURN server count
     const turnServers = pcConfig.iceServers.filter(s => 
       s.urls && (Array.isArray(s.urls) ? s.urls : [s.urls]).some(u => u.startsWith('turn'))
     );
@@ -1073,7 +1076,6 @@ async function loadIceServers() {
     
   } catch (err) {
     console.error('❌ Failed to fetch ICE servers:', err);
-    // Fallback configuration with your ExpressTurn credentials
     pcConfig.iceServers = [
       {
         urls: ['turn:relay1.expressturn.com:3480'],
@@ -1147,10 +1149,7 @@ async function handleSignalingMessage(data) {
         updateRoomDisplay();
       }
       
-      if (isAdmin) {
-        document.getElementById('endMeetingBtn').classList.remove('hidden');
-        document.getElementById('muteAllBtn').classList.remove('hidden');
-      }
+      updateAdminUI();
       break;
       
     case 'room_created':
@@ -1163,8 +1162,13 @@ async function handleSignalingMessage(data) {
       console.log('📋 Room state received:', data.participants.length, 'participants');
       for (const p of data.participants) {
         if (p.clientId !== clientId) {
-          addParticipantToList(p.clientId, p.username);
-          // Create offer for each existing participant
+          participantsState.set(p.clientId, {
+            username: p.username,
+            isMuted: p.isMuted,
+            isAdminMuted: p.isAdminMuted,
+            handRaised: p.handRaised
+          });
+          addParticipantToList(p.clientId, p.username, p.handRaised, p.isAdminMuted);
           await createOffer(p.clientId, p.username);
         }
       }
@@ -1172,8 +1176,13 @@ async function handleSignalingMessage(data) {
       
     case 'peer_joined':
       showToast(`${data.username} joined`, 'info');
-      addParticipantToList(data.clientId, data.username);
-      // New peer joined, they will send us an offer
+      participantsState.set(data.clientId, {
+        username: data.username,
+        isMuted: false,
+        isAdminMuted: false,
+        handRaised: false
+      });
+      addParticipantToList(data.clientId, data.username, false, false);
       break;
       
     case 'offer':
@@ -1189,14 +1198,79 @@ async function handleSignalingMessage(data) {
       break;
       
     case 'force_mute':
-      if (data.targetClientId === clientId && data.muteState) {
-        isMuted = true;
-        if (localStream) {
-          localStream.getAudioTracks().forEach(t => t.enabled = false);
+      if (data.targetClientId === clientId) {
+        isAdminMuted = !!data.isAdminMuted;
+        if (data.muteState) {
+          isMuted = true;
+          if (localStream) {
+            localStream.getAudioTracks().forEach(t => t.enabled = false);
+          }
+          updateMicButton();
+          if (isAdminMuted) {
+            showToast('You were muted by the host. Request to unmute if needed.', 'info');
+          }
+        } else {
+          isAdminMuted = false;
+          showToast('Host allowed you to unmute', 'success');
         }
-        updateMicButton();
-        showToast('You were muted by the host', 'info');
+      } else {
+        const pState = participantsState.get(data.targetClientId);
+        if (pState) {
+          pState.isAdminMuted = !!data.isAdminMuted;
+          updateParticipantMuteStatus(data.targetClientId, data.isAdminMuted);
+        }
       }
+      break;
+      
+    case 'hand_status_changed':
+      if (data.clientId !== clientId) {
+        const pState = participantsState.get(data.clientId);
+        if (pState) {
+          pState.handRaised = data.handRaised;
+          updateParticipantHandStatus(data.clientId, data.handRaised);
+        }
+        
+        if (data.handRaised && isAdmin) {
+          showToast(`✋ ${data.username} raised hand`, 'info');
+        }
+      }
+      break;
+      
+    case 'all_hands_lowered':
+      participantsState.forEach((state, id) => {
+        state.handRaised = false;
+        updateParticipantHandStatus(id, false);
+      });
+      break;
+      
+    case 'unmute_request':
+      showUnmuteRequestModal(data.fromClientId, data.fromUsername);
+      break;
+      
+    case 'unmute_request_sent':
+      showToast('Unmute request sent to host', 'info');
+      break;
+      
+    case 'admin_changed':
+      showToast(`${data.newAdminName} is now the host`, 'info');
+      if (data.newAdminId === clientId) {
+        isAdmin = true;
+        updateAdminUI();
+      } else if (data.oldAdminId === clientId) {
+        isAdmin = false;
+        updateAdminUI();
+      }
+      updateParticipantsList();
+      break;
+      
+    case 'admin_transferred':
+      showToast(`Admin transferred to ${data.newAdminName}`, 'info');
+      isAdmin = false;
+      updateAdminUI();
+      break;
+      
+    case 'promoted_to_admin':
+      showToast(`You are now the host (promoted by ${data.byUsername})`, 'success');
       break;
       
     case 'new_chat_message':
@@ -1205,6 +1279,7 @@ async function handleSignalingMessage(data) {
       
     case 'peer_left':
       removePeer(data.clientId);
+      participantsState.delete(data.clientId);
       showToast(`Participant left`, 'info');
       break;
       
@@ -1221,6 +1296,23 @@ async function handleSignalingMessage(data) {
       
     default:
       console.warn('Unknown message type:', data.type);
+  }
+}
+
+// ===== ADMIN UI UPDATES =====
+function updateAdminUI() {
+  const endMeetingBtn = document.getElementById('endMeetingBtn');
+  const muteAllBtn = document.getElementById('muteAllBtn');
+  const raiseHandBtn = document.getElementById('raiseHandBtn');
+  
+  if (isAdmin) {
+    endMeetingBtn?.classList.remove('hidden');
+    muteAllBtn?.classList.remove('hidden');
+    raiseHandBtn?.classList.add('hidden');
+  } else {
+    endMeetingBtn?.classList.add('hidden');
+    muteAllBtn?.classList.add('hidden');
+    raiseHandBtn?.classList.remove('hidden');
   }
 }
 
@@ -1353,9 +1445,6 @@ async function setupLocalStream() {
     });
     
     console.log('✅ Local stream obtained');
-    console.log('🎬 Video tracks:', localStream.getVideoTracks().length);
-    console.log('🎤 Audio tracks:', localStream.getAudioTracks().length);
-    
     addVideoElement(clientId, localStream, true, googleUser.name);
   } catch (err) {
     console.error('❌ getUserMedia failed:', err);
@@ -1386,6 +1475,9 @@ function addVideoElement(id, stream, isLocal = false, username = 'Participant') 
       <div class="video-indicators">
         <div class="indicator muted hidden" id="muted-${id}">
           <i class="fas fa-microphone-slash"></i>
+        </div>
+        <div class="indicator hand-raised hidden" id="hand-${id}">
+          <i class="fas fa-hand-paper"></i>
         </div>
       </div>
     `;
@@ -1421,7 +1513,7 @@ function removeVideoElement(id) {
   }
 }
 
-// ===== WEBRTC PEER CONNECTION - ENHANCED =====
+// ===== WEBRTC PEER CONNECTION =====
 function createPeerConnection(id, username) {
   if (peers[id]) {
     console.log(`♻️ Reusing existing peer connection for ${id}`);
@@ -1429,11 +1521,9 @@ function createPeerConnection(id, username) {
   }
   
   console.log(`🔧 Creating NEW peer connection for ${id} (${username})`);
-  console.log(`📡 Using ${pcConfig.iceServers.length} ICE servers`);
   
   const pc = new RTCPeerConnection(pcConfig);
   
-  // Initialize ICE candidate queue
   peers[id] = { 
     pc, 
     username,
@@ -1441,94 +1531,46 @@ function createPeerConnection(id, username) {
     remoteDescriptionSet: false
   };
   
-  // Add local tracks with better error handling
   if (localStream) {
-    let audioAdded = false;
-    let videoAdded = false;
-    
     for (const track of localStream.getTracks()) {
       try {
         pc.addTrack(track, localStream);
-        if (track.kind === 'audio') audioAdded = true;
-        if (track.kind === 'video') videoAdded = true;
         console.log(`✅ Added ${track.kind} track to peer ${id}`);
       } catch (e) {
         console.error(`❌ Failed to add ${track.kind} track to ${id}:`, e);
       }
     }
-    
-    console.log(`📊 Tracks added to ${id}: Audio=${audioAdded}, Video=${videoAdded}`);
-  } else {
-    console.warn(`⚠️ No local stream when creating PC for ${id}`);
   }
   
-  // Handle incoming tracks
   pc.ontrack = (event) => {
     console.log(`🎥 Received ${event.track.kind} track from ${id}`);
-    console.log(`📦 Track state: ${event.track.readyState}`);
     
     if (event.streams && event.streams[0]) {
-      console.log(`📺 Adding video element for ${id} with stream`);
       addVideoElement(id, event.streams[0], false, username);
-    } else {
-      console.warn(`⚠️ Track received without stream from ${id}`);
-      let remoteStream = document.getElementById(`video-${id}`)?.querySelector('video')?.srcObject;
-      if (!remoteStream) {
-        remoteStream = new MediaStream();
-        addVideoElement(id, remoteStream, false, username);
-      }
-      remoteStream.addTrack(event.track);
     }
   };
   
-  // Handle ICE candidates - CRITICAL FOR CONNECTIVITY
   pc.onicecandidate = (event) => {
     if (event.candidate) {
-      console.log(`🧊 ICE candidate for ${id}:`, event.candidate.type, event.candidate.protocol);
       sendSignalingMessage({
         type: 'ice_candidate',
         candidate: event.candidate,
         targetClientId: id
       });
-    } else {
-      console.log(`✅ ICE gathering complete for ${id}`);
     }
   };
   
-  // ICE gathering state
-  pc.onicegatheringstatechange = () => {
-    console.log(`🔍 ICE gathering state for ${id}: ${pc.iceGatheringState}`);
-  };
-  
-  // ICE connection state - ENHANCED MONITORING
   pc.oniceconnectionstatechange = () => {
     const state = pc.iceConnectionState;
     console.log(`🔌 ICE connection state for ${id}: ${state}`);
     
     if (state === 'connected' || state === 'completed') {
       showToast(`Connected to ${username}`, 'success');
-      console.log(`✅ Successfully connected to ${id}`);
-      
-      // Log connection stats
-      pc.getStats().then(stats => {
-        stats.forEach(report => {
-          if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-            console.log(`🎯 Active connection for ${id}:`, report.transportType);
-          }
-        });
-      });
-      
     } else if (state === 'failed') {
       console.error(`❌ Connection FAILED for ${id}`);
-      showToast(`Connection failed with ${username}`, 'error');
-      
-      // Attempt ICE restart
       setTimeout(async () => {
-        console.log(`🔄 Attempting ICE restart for ${id}...`);
         try {
-          if (pc.restartIce) {
-            pc.restartIce();
-          }
+          if (pc.restartIce) pc.restartIce();
           const offer = await pc.createOffer({ iceRestart: true });
           await pc.setLocalDescription(offer);
           sendSignalingMessage({
@@ -1536,52 +1578,18 @@ function createPeerConnection(id, username) {
             sdp: pc.localDescription,
             targetClientId: id
           });
-          console.log(`✅ ICE restart initiated for ${id}`);
         } catch (err) {
           console.error(`❌ ICE restart failed for ${id}:`, err);
         }
       }, 2000);
-      
-    } else if (state === 'disconnected') {
-      console.warn(`⚠️ Temporarily disconnected from ${id}`);
-      showToast(`Connection unstable with ${username}`, 'info');
-      
-      // Wait a bit before reconnecting
-      setTimeout(() => {
-        if (pc.iceConnectionState === 'disconnected') {
-          console.log(`🔄 Still disconnected from ${id}, attempting restart...`);
-          if (pc.restartIce) {
-            pc.restartIce();
-          }
-        }
-      }, 5000);
-      
-    } else if (state === 'checking') {
-      console.log(`🔍 Checking connection to ${id}...`);
     }
-  };
-  
-  // Connection state
-  pc.onconnectionstatechange = () => {
-    console.log(`🔗 Peer connection state for ${id}: ${pc.connectionState}`);
-    
-    if (pc.connectionState === 'failed') {
-      console.error(`❌ Peer connection FAILED for ${id}`);
-    } else if (pc.connectionState === 'connected') {
-      console.log(`✅ Peer connection ESTABLISHED with ${id}`);
-    }
-  };
-  
-  // Signaling state
-  pc.onsignalingstatechange = () => {
-    console.log(`📡 Signaling state for ${id}: ${pc.signalingState}`);
   };
   
   return pc;
 }
 
 async function createOffer(targetId, targetUsername) {
-  console.log(`📤 Creating offer for ${targetId} (${targetUsername})`);
+  console.log(`📤 Creating offer for ${targetId}`);
   
   const pc = createPeerConnection(targetId, targetUsername);
   
@@ -1591,9 +1599,7 @@ async function createOffer(targetId, targetUsername) {
       offerToReceiveVideo: true
     });
     
-    console.log(`✅ Offer created for ${targetId}`);
     await pc.setLocalDescription(offer);
-    console.log(`✅ Local description set for ${targetId}`);
     
     sendSignalingMessage({
       type: 'offer',
@@ -1604,39 +1610,28 @@ async function createOffer(targetId, targetUsername) {
     console.log(`📨 Offer sent to ${targetId}`);
   } catch (err) {
     console.error(`❌ Failed to create offer for ${targetId}:`, err);
-    showToast(`Failed to connect to ${targetUsername}`, 'error');
   }
 }
 
 async function handleOffer(fromId, fromUsername, sdp) {
-  console.log(`📥 Received offer from ${fromId} (${fromUsername})`);
+  console.log(`📥 Received offer from ${fromId}`);
   
   const pc = createPeerConnection(fromId, fromUsername);
   const peer = peers[fromId];
   
   try {
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-    console.log(`✅ Remote description set for ${fromId}`);
     peer.remoteDescriptionSet = true;
     
-    // Process queued ICE candidates
     if (peer.iceCandidateQueue.length > 0) {
-      console.log(`🧊 Processing ${peer.iceCandidateQueue.length} queued ICE candidates for ${fromId}`);
       for (const candidate of peer.iceCandidateQueue) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (err) {
-          console.error(`❌ Failed to add queued candidate for ${fromId}:`, err);
-        }
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
       }
       peer.iceCandidateQueue = [];
     }
     
     const answer = await pc.createAnswer();
-    console.log(`✅ Answer created for ${fromId}`);
-    
     await pc.setLocalDescription(answer);
-    console.log(`✅ Local description set for ${fromId}`);
     
     sendSignalingMessage({
       type: 'answer',
@@ -1647,7 +1642,6 @@ async function handleOffer(fromId, fromUsername, sdp) {
     console.log(`📨 Answer sent to ${fromId}`);
   } catch (err) {
     console.error(`❌ Failed to handle offer from ${fromId}:`, err);
-    showToast(`Failed to connect to ${fromUsername}`, 'error');
   }
 }
 
@@ -1655,25 +1649,15 @@ async function handleAnswer(fromId, sdp) {
   console.log(`📥 Received answer from ${fromId}`);
   
   const peer = peers[fromId];
-  if (!peer) {
-    console.warn(`⚠️ Received answer from unknown peer: ${fromId}`);
-    return;
-  }
+  if (!peer) return;
   
   try {
     await peer.pc.setRemoteDescription(new RTCSessionDescription(sdp));
-    console.log(`✅ Remote description set for ${fromId}`);
     peer.remoteDescriptionSet = true;
     
-    // Process queued ICE candidates
     if (peer.iceCandidateQueue.length > 0) {
-      console.log(`🧊 Processing ${peer.iceCandidateQueue.length} queued ICE candidates for ${fromId}`);
       for (const candidate of peer.iceCandidateQueue) {
-        try {
-          await peer.pc.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (err) {
-          console.error(`❌ Failed to add queued candidate for ${fromId}:`, err);
-        }
+        await peer.pc.addIceCandidate(new RTCIceCandidate(candidate));
       }
       peer.iceCandidateQueue = [];
     }
@@ -1684,19 +1668,12 @@ async function handleAnswer(fromId, sdp) {
 
 async function handleIceCandidate(fromId, candidate) {
   const peer = peers[fromId];
-  if (!peer) {
-    console.warn(`⚠️ Received ICE candidate from unknown peer: ${fromId}`);
-    return;
-  }
-  
-  console.log(`🧊 Received ICE candidate from ${fromId}:`, candidate.type, candidate.protocol);
+  if (!peer) return;
   
   try {
     if (peer.remoteDescriptionSet) {
       await peer.pc.addIceCandidate(new RTCIceCandidate(candidate));
-      console.log(`✅ ICE candidate added for ${fromId}`);
     } else {
-      console.log(`⏳ Queueing ICE candidate for ${fromId} (remote description not set yet)`);
       peer.iceCandidateQueue.push(candidate);
     }
   } catch (err) {
@@ -1707,6 +1684,11 @@ async function handleIceCandidate(fromId, candidate) {
 // ===== MEDIA CONTROLS =====
 function toggleMic() {
   if (!localStream) return;
+  
+  if (isAdminMuted && isMuted) {
+    showRequestUnmuteModal();
+    return;
+  }
   
   isMuted = !isMuted;
   localStream.getAudioTracks().forEach(track => {
@@ -1724,9 +1706,14 @@ function updateMicButton() {
   if (isMuted) {
     icon.className = 'fas fa-microphone-slash';
     btn.classList.add('active');
+    
+    if (isAdminMuted) {
+      btn.title = 'Request to unmute';
+    }
   } else {
     icon.className = 'fas fa-microphone';
     btn.classList.remove('active');
+    btn.title = 'Mute/Unmute';
   }
 }
 
@@ -1755,8 +1742,126 @@ function updateCameraButton() {
   }
 }
 
+// ===== RAISE HAND FEATURE =====
+function toggleRaiseHand() {
+  handRaised = !handRaised;
+  
+  sendSignalingMessage({
+    type: 'raise_hand',
+    handRaised
+  });
+  
+  updateRaiseHandButton();
+  
+  updateParticipantHandStatus(clientId, handRaised);
+  
+  showToast(handRaised ? '✋ Hand raised' : 'Hand lowered', 'info');
+}
+
+function updateRaiseHandButton() {
+  const btn = document.getElementById('raiseHandBtn');
+  if (!btn) return;
+  
+  const icon = btn.querySelector('i');
+  
+  if (handRaised) {
+    icon.className = 'fas fa-hand-paper';
+    btn.classList.add('active');
+    btn.title = 'Lower hand';
+  } else {
+    icon.className = 'far fa-hand-paper';
+    btn.classList.remove('active');
+    btn.title = 'Raise hand';
+  }
+}
+
+function updateParticipantHandStatus(participantId, raised) {
+  const handIndicator = document.getElementById(`hand-${participantId}`);
+  if (handIndicator) {
+    if (raised) {
+      handIndicator.classList.remove('hidden');
+    } else {
+      handIndicator.classList.add('hidden');
+    }
+  }
+  
+  const listItem = document.getElementById(`participant-${participantId}`);
+  if (listItem) {
+    const handIcon = listItem.querySelector('.hand-status');
+    if (handIcon) {
+      if (raised) {
+        handIcon.classList.remove('hidden');
+      } else {
+        handIcon.classList.add('hidden');
+      }
+    }
+  }
+}
+
+// ===== UNMUTE REQUEST MODAL =====
+function showRequestUnmuteModal() {
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  modal.innerHTML = `
+    <div class="modal-content">
+      <h3>Request to Unmute</h3>
+      <p>The host has muted you. Would you like to request permission to unmute?</p>
+      <div class="modal-actions">
+        <button class="btn-secondary" onclick="closeModal(this)">Cancel</button>
+        <button class="btn-primary" onclick="sendUnmuteRequest(); closeModal(this);">Send Request</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+}
+
+function sendUnmuteRequest() {
+  sendSignalingMessage({
+    type: 'request_unmute'
+  });
+  showToast('Request sent to host', 'info');
+}
+
+function showUnmuteRequestModal(fromId, fromUsername) {
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  modal.innerHTML = `
+    <div class="modal-content">
+      <h3>Unmute Request</h3>
+      <p><strong>${fromUsername}</strong> is requesting permission to unmute.</p>
+      <div class="modal-actions">
+        <button class="btn-secondary" onclick="closeModal(this)">Deny</button>
+        <button class="btn-primary" onclick="approveUnmute('${fromId}'); closeModal(this);">Approve</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+}
+
+function approveUnmute(targetId) {
+  sendSignalingMessage({
+    type: 'admin_control',
+    action: 'mute_toggle',
+    targetClientId: targetId,
+    muteState: false,
+    adminToken
+  });
+  
+  const pState = participantsState.get(targetId);
+  if (pState) {
+    showToast(`Approved unmute for ${pState.username}`, 'success');
+  }
+}
+
+function closeModal(btn) {
+  const modal = btn.closest('.modal-overlay');
+  if (modal) {
+    modal.remove();
+  }
+}
+
 // ===== PARTICIPANTS PANEL =====
-function addParticipantToList(id, username) {
+function addParticipantToList(id, username, handRaised = false, isAdminMuted = false) {
   const list = document.getElementById('participantsList');
   
   let item = document.getElementById(`participant-${id}`);
@@ -1774,11 +1879,19 @@ function addParticipantToList(id, username) {
           <p>${username}</p>
           <span>${id === clientId ? 'You' : 'Participant'}</span>
         </div>
+        <div class="participant-status">
+          <div class="hand-status ${handRaised ? '' : 'hidden'}" title="Hand raised">
+            <i class="fas fa-hand-paper"></i>
+          </div>
+        </div>
       </div>
       ${isAdmin && id !== clientId ? `
         <div class="participant-controls">
-          <button class="btn-icon" onclick="toggleParticipantMute('${id}')" title="Mute/Unmute">
-            <i class="fas fa-microphone"></i>
+          <button class="btn-icon ${isAdminMuted ? 'muted' : ''}" onclick="toggleParticipantMute('${id}')" title="${isAdminMuted ? 'Unmute' : 'Mute'}">
+            <i class="fas fa-microphone${isAdminMuted ? '-slash' : ''}"></i>
+          </button>
+          <button class="btn-icon" onclick="showTransferAdminModal('${id}', '${username}')" title="Transfer Admin">
+            <i class="fas fa-crown"></i>
           </button>
         </div>
       ` : ''}
@@ -1806,29 +1919,112 @@ function updateParticipantCount() {
   document.getElementById('participantCountBadge').textContent = count;
 }
 
+function updateParticipantMuteStatus(participantId, isAdminMuted) {
+  const listItem = document.getElementById(`participant-${participantId}`);
+  if (listItem && isAdmin) {
+    const muteBtn = listItem.querySelector('.participant-controls button:first-child');
+    if (muteBtn) {
+      const icon = muteBtn.querySelector('i');
+      if (isAdminMuted) {
+        muteBtn.classList.add('muted');
+        icon.className = 'fas fa-microphone-slash';
+        muteBtn.title = 'Unmute';
+      } else {
+        muteBtn.classList.remove('muted');
+        icon.className = 'fas fa-microphone';
+        muteBtn.title = 'Mute';
+      }
+    }
+  }
+}
+
+function updateParticipantsList() {
+  const list = document.getElementById('participantsList');
+  list.innerHTML = '';
+  
+  if (clientId && googleUser) {
+    addParticipantToList(clientId, googleUser.name, handRaised, false);
+  }
+  
+  participantsState.forEach((state, id) => {
+    addParticipantToList(id, state.username, state.handRaised, state.isAdminMuted);
+  });
+}
+
 // ===== ADMIN CONTROLS =====
 function toggleParticipantMute(targetId) {
   if (!isAdmin) return;
+  
+  const pState = participantsState.get(targetId);
+  if (!pState) return;
+  
+  const newMuteState = !pState.isAdminMuted;
   
   sendSignalingMessage({
     type: 'admin_control',
     action: 'mute_toggle',
     targetClientId: targetId,
-    muteState: true,
+    muteState: newMuteState,
     adminToken
   });
+  
+  pState.isAdminMuted = newMuteState;
+  updateParticipantMuteStatus(targetId, newMuteState);
+  
+  showToast(`${newMuteState ? 'Muted' : 'Unmuted'} ${pState.username}`, 'success');
 }
 
 function muteAll() {
   if (!isAdmin) return;
   
-  if (confirm('Mute all participants?')) {
+  if (confirm('Mute all participants? They will need to request permission to unmute.')) {
     sendSignalingMessage({
       type: 'admin_control',
       action: 'mute_all',
       adminToken
     });
+    
+    participantsState.forEach((state, id) => {
+      state.isAdminMuted = true;
+      state.handRaised = false;
+      updateParticipantMuteStatus(id, true);
+      updateParticipantHandStatus(id, false);
+    });
+    
     showToast('All participants muted', 'success');
+  }
+}
+
+function showTransferAdminModal(targetId, targetUsername) {
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  modal.innerHTML = `
+    <div class="modal-content">
+      <h3>Transfer Host Privileges</h3>
+      <p>Are you sure you want to transfer host privileges to <strong>${targetUsername}</strong>?</p>
+      <p class="warning-text">You will no longer be the host after this action.</p>
+      <div class="modal-actions">
+        <button class="btn-secondary" onclick="closeModal(this)">Cancel</button>
+        <button class="btn-primary" onclick="transferAdmin('${targetId}'); closeModal(this);">Transfer</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+}
+
+function transferAdmin(targetId) {
+  if (!isAdmin) return;
+  
+  sendSignalingMessage({
+    type: 'admin_control',
+    action: 'transfer_admin',
+    targetClientId: targetId,
+    adminToken
+  });
+  
+  const pState = participantsState.get(targetId);
+  if (pState) {
+    showToast(`Transferring host to ${pState.username}...`, 'info');
   }
 }
 
@@ -1905,24 +2101,6 @@ function formatTime(date) {
   return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 }
 
-// Auto-resize chat input
-document.addEventListener('DOMContentLoaded', () => {
-  const chatInput = document.getElementById('chatInput');
-  if (chatInput) {
-    chatInput.addEventListener('input', function() {
-      this.style.height = 'auto';
-      this.style.height = Math.min(this.scrollHeight, 120) + 'px';
-    });
-    
-    chatInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        sendChatMessage();
-      }
-    });
-  }
-});
-
 // ===== SIDE PANEL MANAGEMENT =====
 function toggleSidePanel(tab) {
   const panel = document.getElementById('sidePanel');
@@ -1972,8 +2150,10 @@ function showMeetingRoom() {
   isInMeeting = true;
   
   if (clientId && googleUser) {
-    addParticipantToList(clientId, googleUser.name);
+    addParticipantToList(clientId, googleUser.name, false, false);
   }
+  
+  updateAdminUI();
 }
 
 function showLandingPage() {
@@ -2005,7 +2185,6 @@ function leaveMeeting() {
   
   console.log('🚪 Leaving meeting...');
   
-  // Close all peer connections
   Object.keys(peers).forEach(id => {
     try {
       peers[id].pc.close();
@@ -2016,7 +2195,6 @@ function leaveMeeting() {
   });
   peers = {};
   
-  // Stop local media tracks
   if (localStream) {
     localStream.getTracks().forEach(track => {
       try {
@@ -2029,35 +2207,33 @@ function leaveMeeting() {
     localStream = null;
   }
   
-  // Clear video grid
   const videoGrid = document.getElementById('videoGrid');
   if (videoGrid) {
     videoGrid.innerHTML = '';
   }
   
-  // Clear participants list
   const participantsList = document.getElementById('participantsList');
   if (participantsList) {
     participantsList.innerHTML = '';
   }
   
-  // Clear chat
   const chatMessages = document.getElementById('chatMessages');
   if (chatMessages) {
     chatMessages.innerHTML = '';
   }
   
-  // Reset state
   clientId = null;
   roomId = null;
   isAdmin = false;
   adminToken = null;
   isMuted = false;
+  isAdminMuted = false;
   isCameraOff = false;
+  handRaised = false;
   unreadMessages = 0;
   isInMeeting = false;
+  participantsState.clear();
   
-  // Close WebSocket
   if (ws) {
     try {
       ws.close();
@@ -2071,7 +2247,6 @@ function leaveMeeting() {
   showLandingPage();
   showToast('Left the meeting', 'info');
   
-  // Reconnect WebSocket for next meeting
   setTimeout(() => {
     initWebSocket();
   }, 1000);
@@ -2091,20 +2266,16 @@ function sendSignalingMessage(message) {
 document.addEventListener('DOMContentLoaded', async () => {
   console.log('🚀 Initializing app...');
   
-  // Load ICE servers first
   await loadIceServers();
   
-  // Initialize Google Sign-In
   try {
     initGoogleSignIn();
   } catch (e) {
     console.warn('⚠️ Google Sign-In initialization failed:', e);
   }
   
-  // Connect to signaling server
   initWebSocket();
   
-  // Handle Enter key on room input
   const roomInput = document.getElementById('roomIdInput');
   if (roomInput) {
     roomInput.addEventListener('keypress', (e) => {
@@ -2113,23 +2284,38 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     });
     
-    // Auto-uppercase room code
     roomInput.addEventListener('input', (e) => {
       e.target.value = e.target.value.toUpperCase();
     });
   }
   
-  // Close side panel on Escape key
+  const chatInput = document.getElementById('chatInput');
+  if (chatInput) {
+    chatInput.addEventListener('input', function() {
+      this.style.height = 'auto';
+      this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+    });
+    
+    chatInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendChatMessage();
+      }
+    });
+  }
+  
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       const panel = document.getElementById('sidePanel');
       if (panel.classList.contains('open')) {
         closeSidePanel();
       }
+      
+      const modals = document.querySelectorAll('.modal-overlay');
+      modals.forEach(modal => modal.remove());
     }
   });
   
-  // Prevent accidental page reload
   window.addEventListener('beforeunload', (e) => {
     if (isInMeeting) {
       e.preventDefault();
@@ -2138,16 +2324,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
   
-  // Handle visibility change for quality optimization
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-      console.log('📴 Page hidden - reducing quality');
-    } else {
-      console.log('📱 Page visible - restoring quality');
-    }
-  });
-  
-  // Monitor connection quality periodically
   setInterval(() => {
     if (isInMeeting && Object.keys(peers).length > 0) {
       monitorConnectionQuality();
@@ -2166,19 +2342,13 @@ async function monitorConnectionQuality() {
       const stats = await peer.pc.getStats();
       
       stats.forEach(report => {
-        // Monitor candidate pair for active connection
         if (report.type === 'candidate-pair' && report.state === 'succeeded') {
           const transport = report.transportType || 'unknown';
-          
-          // Log if using relay (TURN) - good for troubleshooting
           if (transport === 'relay') {
             console.log(`🔄 ${peerId} using TURN relay connection`);
-          } else {
-            console.log(`🎯 ${peerId} using direct connection (${transport})`);
           }
         }
         
-        // Monitor inbound video
         if (report.type === 'inbound-rtp' && report.kind === 'video') {
           const packetsLost = report.packetsLost || 0;
           const packetsReceived = report.packetsReceived || 0;
@@ -2203,6 +2373,7 @@ window.joinRoomPrompt = joinRoomPrompt;
 window.copyRoomId = copyRoomId;
 window.toggleMic = toggleMic;
 window.toggleCamera = toggleCamera;
+window.toggleRaiseHand = toggleRaiseHand;
 window.leaveMeeting = leaveMeeting;
 window.endMeeting = endMeeting;
 window.toggleSidePanel = toggleSidePanel;
@@ -2212,3 +2383,8 @@ window.sendChatMessage = sendChatMessage;
 window.toggleParticipantMute = toggleParticipantMute;
 window.muteAll = muteAll;
 window.signOut = signOut;
+window.sendUnmuteRequest = sendUnmuteRequest;
+window.approveUnmute = approveUnmute;
+window.closeModal = closeModal;
+window.transferAdmin = transferAdmin;
+window.showTransferAdminModal = showTransferAdminModal;

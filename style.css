@@ -380,6 +380,12 @@ body {
   color: var(--danger-red);
 }
 
+.indicator.hand-raised {
+  color: #FFD700;
+  background: rgba(255, 215, 0, 0.2);
+  animation: pulse-hand 1.5s ease-in-out infinite;
+}
+
 .indicator.speaking {
   animation: pulse-border 1s ease-in-out infinite;
 }
@@ -1033,6 +1039,17 @@ body {
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.5; }
+}
+
+@keyframes pulse-hand {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.1);
+    opacity: 0.8;
+  }
 }
 
 @keyframes spin {
