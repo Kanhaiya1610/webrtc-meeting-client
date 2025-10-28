@@ -909,7 +909,7 @@
 const WS_URL = "wss://webrtc-meeting-server.onrender.com";      // <--- update to your Render URL
 const ICE_ENDPOINT = "https://webrtc-meeting-server.onrender.com/ice"; // <--- update to your Render URL
 const GOOGLE_CLIENT_ID = "173379398027-i3h11rufg14tpde9rhutp0uvt3imos3k.apps.googleusercontent.com";// <--- set this
-// ===== CONFIGURATION =====
+
 // ===== STATE =====
 let googleUser = null;
 let ws = null;
@@ -1371,9 +1371,11 @@ function removeVideoElement(id) {
 // ===== WEBRTC PEER CONNECTION =====
 function createPeerConnection(id, username) {
   if (peers[id]) {
+    console.log(`Reusing existing peer connection for ${id}`);
     return peers[id].pc;
   }
   
+  console.log(`Creating NEW peer connection for ${id} (${username})`);
   const pc = new RTCPeerConnection(pcConfig);
   peers[id] = { pc, username };
   
@@ -1381,49 +1383,90 @@ function createPeerConnection(id, username) {
   if (localStream) {
     for (const track of localStream.getTracks()) {
       try {
-        pc.addTrack(track, localStream);
+        const sender = pc.addTrack(track, localStream);
+        console.log(`✅ Added ${track.kind} track to peer ${id}`);
       } catch (e) {
-        console.warn('Failed to add track:', e);
+        console.error(`❌ Failed to add track to ${id}:`, e);
       }
     }
+  } else {
+    console.warn(`⚠️ No local stream when creating PC for ${id}`);
   }
   
   // Handle incoming tracks
   pc.ontrack = (event) => {
-    console.log('Received track from', id);
+    console.log(`🎥 Received ${event.track.kind} track from ${id}`);
     if (event.streams && event.streams[0]) {
+      console.log(`📺 Adding video element for ${id}`);
       addVideoElement(id, event.streams[0], false, username);
+    } else {
+      console.warn(`⚠️ Track received without stream from ${id}`);
     }
   };
   
   // Handle ICE candidates
   pc.onicecandidate = (event) => {
     if (event.candidate) {
+      console.log(`🧊 Sending ICE candidate to ${id}:`, event.candidate.candidate);
       sendSignalingMessage({
         type: 'ice_candidate',
         candidate: event.candidate,
         targetClientId: id
       });
+    } else {
+      console.log(`✅ ICE gathering complete for ${id}`);
     }
+  };
+  
+  // Handle ICE gathering state
+  pc.onicegatheringstatechange = () => {
+    console.log(`ICE gathering state for ${id}: ${pc.iceGatheringState}`);
   };
   
   // Handle connection state
   pc.oniceconnectionstatechange = () => {
-    console.log(`ICE connection state for ${id}:`, pc.iceConnectionState);
+    console.log(`🔌 ICE connection state for ${id}: ${pc.iceConnectionState}`);
     
     if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
       showToast(`Connected to ${username}`, 'success');
+      console.log(`✅ Successfully connected to ${id}`);
     } else if (pc.iceConnectionState === 'failed') {
-      console.error('Connection failed for', id);
+      console.error(`❌ Connection failed for ${id}`);
+      showToast(`Connection failed with ${username}`, 'error');
+      
       // Attempt ICE restart
-      if (pc.restartIce) {
-        pc.restartIce();
-      }
+      setTimeout(async () => {
+        console.log(`🔄 Attempting ICE restart for ${id}`);
+        if (pc.restartIce) {
+          pc.restartIce();
+        }
+        // Re-create offer
+        try {
+          const offer = await pc.createOffer({ iceRestart: true });
+          await pc.setLocalDescription(offer);
+          sendSignalingMessage({
+            type: 'offer',
+            sdp: pc.localDescription,
+            targetClientId: id
+          });
+        } catch (err) {
+          console.error(`Failed to restart ICE for ${id}:`, err);
+        }
+      }, 2000);
+    } else if (pc.iceConnectionState === 'disconnected') {
+      console.warn(`⚠️ Disconnected from ${id}, waiting...`);
+      showToast(`Connection unstable with ${username}`, 'info');
     }
   };
   
   pc.onconnectionstatechange = () => {
-    console.log(`Connection state for ${id}:`, pc.connectionState);
+    console.log(`🔗 Connection state for ${id}: ${pc.connectionState}`);
+    
+    if (pc.connectionState === 'failed') {
+      console.error(`❌ Peer connection failed for ${id}`);
+    } else if (pc.connectionState === 'connected') {
+      console.log(`✅ Peer connection established with ${id}`);
+    }
   };
   
   return pc;
