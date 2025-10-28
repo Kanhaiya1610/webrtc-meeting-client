@@ -903,7 +903,7 @@
 // document.addEventListener('DOMContentLoaded', init);
 
 
-// frontend/main.js - revised and synced with your backend
+// frontend/main.js - Enhanced with robust WebRTC connectivity
 
 // ======== Configuration ========
 const WS_URL = "wss://webrtc-meeting-server.onrender.com";      // <--- update to your Render URL
@@ -920,8 +920,13 @@ let isAdmin = false;
 let adminToken = null;
 let isMuted = false;
 let isCameraOff = false;
-let peers = {}; // { clientId: { pc, username } }
-let pcConfig = { iceServers: [] };
+let peers = {}; // { clientId: { pc, username, iceCandidateQueue } }
+let pcConfig = { 
+  iceServers: [],
+  iceCandidatePoolSize: 10,
+  bundlePolicy: 'max-bundle',
+  rtcpMuxPolicy: 'require'
+};
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
 let unreadMessages = 0;
@@ -1012,14 +1017,12 @@ function handleCredentialResponse(response) {
     
     console.log('Google signed in:', googleUser);
     
-    // Update UI
     document.getElementById('authStatus').classList.add('hidden');
     document.getElementById('gSignInDiv').style.display = 'none';
     
     const afterAuth = document.getElementById('afterAuth');
     afterAuth.classList.remove('hidden');
     
-    // Set user info
     const avatar = document.getElementById('userAvatar');
     avatar.textContent = googleUser.name.charAt(0).toUpperCase();
     document.getElementById('userName').textContent = googleUser.name;
@@ -1032,22 +1035,59 @@ function handleCredentialResponse(response) {
   }
 }
 
+function signOut() {
+  if (isInMeeting) {
+    if (!confirm('You are in a meeting. Are you sure you want to sign out?')) {
+      return;
+    }
+    leaveMeeting();
+  }
+  
+  googleUser = null;
+  document.getElementById('afterAuth').classList.add('hidden');
+  document.getElementById('authStatus').classList.remove('hidden');
+  document.getElementById('gSignInDiv').style.display = 'block';
+  
+  showToast('Signed out successfully', 'info');
+}
+
 // ===== ICE SERVER CONFIGURATION =====
 async function loadIceServers() {
   try {
+    console.log('🔧 Loading ICE server configuration...');
     const res = await fetch(ICE_ENDPOINT);
     const data = await res.json();
-    pcConfig.iceServers = data.iceServers || [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' }
-    ];
-    console.log('Loaded ICE servers:', pcConfig.iceServers);
+    
+    pcConfig.iceServers = data.iceServers || [];
+    pcConfig.iceTransportPolicy = data.iceTransportPolicy || 'all';
+    pcConfig.iceCandidatePoolSize = data.iceCandidatePoolSize || 10;
+    
+    console.log('✅ ICE servers loaded:', pcConfig.iceServers.length, 'servers');
+    console.log('🎯 ICE Transport Policy:', pcConfig.iceTransportPolicy);
+    
+    // Log TURN server count
+    const turnServers = pcConfig.iceServers.filter(s => 
+      s.urls && (Array.isArray(s.urls) ? s.urls : [s.urls]).some(u => u.startsWith('turn'))
+    );
+    console.log('🔄 TURN servers available:', turnServers.length);
+    
   } catch (err) {
-    console.warn('Failed to fetch ICE servers, using defaults', err);
+    console.error('❌ Failed to fetch ICE servers:', err);
+    // Fallback configuration with your ExpressTurn credentials
     pcConfig.iceServers = [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' }
+      {
+        urls: ['turn:relay1.expressturn.com:3480'],
+        username: '000000002076989935',
+        credential: 'byPInHD6SuzB8VIXUHdaOwkZlLM='
+      },
+      {
+        urls: ['turn:relay1.expressturn.com:3478'],
+        username: '000000002076989935',
+        credential: 'byPInHD6SuzB8VIXUHdaOwkZlLM='
+      },
+      { urls: 'stun:stun.l.google.com:19302' }
     ];
+    console.log('⚠️ Using fallback ICE configuration');
   }
 }
 
@@ -1061,7 +1101,7 @@ function initWebSocket() {
   ws = new WebSocket(WS_URL);
   
   ws.onopen = () => {
-    console.log('WebSocket connected');
+    console.log('✅ WebSocket connected');
     updateConnectionStatus(true);
     reconnectAttempts = 0;
   };
@@ -1076,12 +1116,12 @@ function initWebSocket() {
   };
   
   ws.onerror = (err) => {
-    console.error('WebSocket error:', err);
+    console.error('❌ WebSocket error:', err);
     updateConnectionStatus(false);
   };
   
   ws.onclose = () => {
-    console.log('WebSocket closed');
+    console.log('⚠️ WebSocket closed');
     updateConnectionStatus(false);
     
     if (isInMeeting && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
@@ -1094,7 +1134,7 @@ function initWebSocket() {
 
 // ===== SIGNALING MESSAGE HANDLER =====
 async function handleSignalingMessage(data) {
-  console.log('Received:', data.type);
+  console.log('📩 Received:', data.type);
   
   switch (data.type) {
     case 'your_info':
@@ -1120,10 +1160,11 @@ async function handleSignalingMessage(data) {
       break;
       
     case 'room_state':
-      // Existing participants in the room
+      console.log('📋 Room state received:', data.participants.length, 'participants');
       for (const p of data.participants) {
         if (p.clientId !== clientId) {
           addParticipantToList(p.clientId, p.username);
+          // Create offer for each existing participant
           await createOffer(p.clientId, p.username);
         }
       }
@@ -1132,9 +1173,7 @@ async function handleSignalingMessage(data) {
     case 'peer_joined':
       showToast(`${data.username} joined`, 'info');
       addParticipantToList(data.clientId, data.username);
-      if (roomId) {
-        await createOffer(data.clientId, data.username);
-      }
+      // New peer joined, they will send us an offer
       break;
       
     case 'offer':
@@ -1291,26 +1330,35 @@ function copyRoomId() {
 
 // ===== LOCAL STREAM SETUP =====
 async function setupLocalStream() {
-  if (localStream) return;
+  if (localStream) {
+    console.log('✅ Local stream already exists');
+    return;
+  }
   
   try {
+    console.log('🎥 Requesting camera and microphone access...');
     localStream = await navigator.mediaDevices.getUserMedia({
       video: {
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-        facingMode: 'user'
+        width: { ideal: 1280, max: 1920 },
+        height: { ideal: 720, max: 1080 },
+        facingMode: 'user',
+        frameRate: { ideal: 30, max: 30 }
       },
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
-        autoGainControl: true
+        autoGainControl: true,
+        sampleRate: 48000
       }
     });
     
+    console.log('✅ Local stream obtained');
+    console.log('🎬 Video tracks:', localStream.getVideoTracks().length);
+    console.log('🎤 Audio tracks:', localStream.getAudioTracks().length);
+    
     addVideoElement(clientId, localStream, true, googleUser.name);
-    console.log('Local stream setup complete');
   } catch (err) {
-    console.error('getUserMedia failed:', err);
+    console.error('❌ getUserMedia failed:', err);
     showToast('Could not access camera/microphone', 'error');
     throw err;
   }
@@ -1346,9 +1394,12 @@ function addVideoElement(id, stream, isLocal = false, username = 'Participant') 
     wrapper.appendChild(overlay);
     
     document.getElementById('videoGrid').appendChild(wrapper);
+    
+    console.log(`✅ Added video element for ${id} (${username})`);
   } else {
     const video = wrapper.querySelector('video');
     video.srcObject = stream;
+    console.log(`🔄 Updated video stream for ${id}`);
   }
   
   updateVideoGrid();
@@ -1358,6 +1409,7 @@ function updateVideoGrid() {
   const grid = document.getElementById('videoGrid');
   const count = grid.children.length;
   grid.setAttribute('data-count', count);
+  console.log(`📊 Video grid updated: ${count} participants`);
 }
 
 function removeVideoElement(id) {
@@ -1365,30 +1417,47 @@ function removeVideoElement(id) {
   if (wrapper) {
     wrapper.remove();
     updateVideoGrid();
+    console.log(`🗑️ Removed video element for ${id}`);
   }
 }
 
-// ===== WEBRTC PEER CONNECTION =====
+// ===== WEBRTC PEER CONNECTION - ENHANCED =====
 function createPeerConnection(id, username) {
   if (peers[id]) {
-    console.log(`Reusing existing peer connection for ${id}`);
+    console.log(`♻️ Reusing existing peer connection for ${id}`);
     return peers[id].pc;
   }
   
-  console.log(`Creating NEW peer connection for ${id} (${username})`);
-  const pc = new RTCPeerConnection(pcConfig);
-  peers[id] = { pc, username };
+  console.log(`🔧 Creating NEW peer connection for ${id} (${username})`);
+  console.log(`📡 Using ${pcConfig.iceServers.length} ICE servers`);
   
-  // Add local tracks
+  const pc = new RTCPeerConnection(pcConfig);
+  
+  // Initialize ICE candidate queue
+  peers[id] = { 
+    pc, 
+    username,
+    iceCandidateQueue: [],
+    remoteDescriptionSet: false
+  };
+  
+  // Add local tracks with better error handling
   if (localStream) {
+    let audioAdded = false;
+    let videoAdded = false;
+    
     for (const track of localStream.getTracks()) {
       try {
-        const sender = pc.addTrack(track, localStream);
+        pc.addTrack(track, localStream);
+        if (track.kind === 'audio') audioAdded = true;
+        if (track.kind === 'video') videoAdded = true;
         console.log(`✅ Added ${track.kind} track to peer ${id}`);
       } catch (e) {
-        console.error(`❌ Failed to add track to ${id}:`, e);
+        console.error(`❌ Failed to add ${track.kind} track to ${id}:`, e);
       }
     }
+    
+    console.log(`📊 Tracks added to ${id}: Audio=${audioAdded}, Video=${videoAdded}`);
   } else {
     console.warn(`⚠️ No local stream when creating PC for ${id}`);
   }
@@ -1396,18 +1465,26 @@ function createPeerConnection(id, username) {
   // Handle incoming tracks
   pc.ontrack = (event) => {
     console.log(`🎥 Received ${event.track.kind} track from ${id}`);
+    console.log(`📦 Track state: ${event.track.readyState}`);
+    
     if (event.streams && event.streams[0]) {
-      console.log(`📺 Adding video element for ${id}`);
+      console.log(`📺 Adding video element for ${id} with stream`);
       addVideoElement(id, event.streams[0], false, username);
     } else {
       console.warn(`⚠️ Track received without stream from ${id}`);
+      let remoteStream = document.getElementById(`video-${id}`)?.querySelector('video')?.srcObject;
+      if (!remoteStream) {
+        remoteStream = new MediaStream();
+        addVideoElement(id, remoteStream, false, username);
+      }
+      remoteStream.addTrack(event.track);
     }
   };
   
-  // Handle ICE candidates
+  // Handle ICE candidates - CRITICAL FOR CONNECTIVITY
   pc.onicecandidate = (event) => {
     if (event.candidate) {
-      console.log(`🧊 Sending ICE candidate to ${id}:`, event.candidate.candidate);
+      console.log(`🧊 ICE candidate for ${id}:`, event.candidate.type, event.candidate.protocol);
       sendSignalingMessage({
         type: 'ice_candidate',
         candidate: event.candidate,
@@ -1418,30 +1495,40 @@ function createPeerConnection(id, username) {
     }
   };
   
-  // Handle ICE gathering state
+  // ICE gathering state
   pc.onicegatheringstatechange = () => {
-    console.log(`ICE gathering state for ${id}: ${pc.iceGatheringState}`);
+    console.log(`🔍 ICE gathering state for ${id}: ${pc.iceGatheringState}`);
   };
   
-  // Handle connection state
+  // ICE connection state - ENHANCED MONITORING
   pc.oniceconnectionstatechange = () => {
-    console.log(`🔌 ICE connection state for ${id}: ${pc.iceConnectionState}`);
+    const state = pc.iceConnectionState;
+    console.log(`🔌 ICE connection state for ${id}: ${state}`);
     
-    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+    if (state === 'connected' || state === 'completed') {
       showToast(`Connected to ${username}`, 'success');
       console.log(`✅ Successfully connected to ${id}`);
-    } else if (pc.iceConnectionState === 'failed') {
-      console.error(`❌ Connection failed for ${id}`);
+      
+      // Log connection stats
+      pc.getStats().then(stats => {
+        stats.forEach(report => {
+          if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+            console.log(`🎯 Active connection for ${id}:`, report.transportType);
+          }
+        });
+      });
+      
+    } else if (state === 'failed') {
+      console.error(`❌ Connection FAILED for ${id}`);
       showToast(`Connection failed with ${username}`, 'error');
       
       // Attempt ICE restart
       setTimeout(async () => {
-        console.log(`🔄 Attempting ICE restart for ${id}`);
-        if (pc.restartIce) {
-          pc.restartIce();
-        }
-        // Re-create offer
+        console.log(`🔄 Attempting ICE restart for ${id}...`);
         try {
+          if (pc.restartIce) {
+            pc.restartIce();
+          }
           const offer = await pc.createOffer({ iceRestart: true });
           await pc.setLocalDescription(offer);
           sendSignalingMessage({
@@ -1449,30 +1536,53 @@ function createPeerConnection(id, username) {
             sdp: pc.localDescription,
             targetClientId: id
           });
+          console.log(`✅ ICE restart initiated for ${id}`);
         } catch (err) {
-          console.error(`Failed to restart ICE for ${id}:`, err);
+          console.error(`❌ ICE restart failed for ${id}:`, err);
         }
       }, 2000);
-    } else if (pc.iceConnectionState === 'disconnected') {
-      console.warn(`⚠️ Disconnected from ${id}, waiting...`);
+      
+    } else if (state === 'disconnected') {
+      console.warn(`⚠️ Temporarily disconnected from ${id}`);
       showToast(`Connection unstable with ${username}`, 'info');
+      
+      // Wait a bit before reconnecting
+      setTimeout(() => {
+        if (pc.iceConnectionState === 'disconnected') {
+          console.log(`🔄 Still disconnected from ${id}, attempting restart...`);
+          if (pc.restartIce) {
+            pc.restartIce();
+          }
+        }
+      }, 5000);
+      
+    } else if (state === 'checking') {
+      console.log(`🔍 Checking connection to ${id}...`);
     }
   };
   
+  // Connection state
   pc.onconnectionstatechange = () => {
-    console.log(`🔗 Connection state for ${id}: ${pc.connectionState}`);
+    console.log(`🔗 Peer connection state for ${id}: ${pc.connectionState}`);
     
     if (pc.connectionState === 'failed') {
-      console.error(`❌ Peer connection failed for ${id}`);
+      console.error(`❌ Peer connection FAILED for ${id}`);
     } else if (pc.connectionState === 'connected') {
-      console.log(`✅ Peer connection established with ${id}`);
+      console.log(`✅ Peer connection ESTABLISHED with ${id}`);
     }
+  };
+  
+  // Signaling state
+  pc.onsignalingstatechange = () => {
+    console.log(`📡 Signaling state for ${id}: ${pc.signalingState}`);
   };
   
   return pc;
 }
 
 async function createOffer(targetId, targetUsername) {
+  console.log(`📤 Creating offer for ${targetId} (${targetUsername})`);
+  
   const pc = createPeerConnection(targetId, targetUsername);
   
   try {
@@ -1481,7 +1591,9 @@ async function createOffer(targetId, targetUsername) {
       offerToReceiveVideo: true
     });
     
+    console.log(`✅ Offer created for ${targetId}`);
     await pc.setLocalDescription(offer);
+    console.log(`✅ Local description set for ${targetId}`);
     
     sendSignalingMessage({
       type: 'offer',
@@ -1489,20 +1601,42 @@ async function createOffer(targetId, targetUsername) {
       targetClientId: targetId
     });
     
-    console.log('Sent offer to', targetId);
+    console.log(`📨 Offer sent to ${targetId}`);
   } catch (err) {
-    console.error('Failed to create offer:', err);
+    console.error(`❌ Failed to create offer for ${targetId}:`, err);
+    showToast(`Failed to connect to ${targetUsername}`, 'error');
   }
 }
 
 async function handleOffer(fromId, fromUsername, sdp) {
+  console.log(`📥 Received offer from ${fromId} (${fromUsername})`);
+  
   const pc = createPeerConnection(fromId, fromUsername);
+  const peer = peers[fromId];
   
   try {
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    console.log(`✅ Remote description set for ${fromId}`);
+    peer.remoteDescriptionSet = true;
+    
+    // Process queued ICE candidates
+    if (peer.iceCandidateQueue.length > 0) {
+      console.log(`🧊 Processing ${peer.iceCandidateQueue.length} queued ICE candidates for ${fromId}`);
+      for (const candidate of peer.iceCandidateQueue) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+          console.error(`❌ Failed to add queued candidate for ${fromId}:`, err);
+        }
+      }
+      peer.iceCandidateQueue = [];
+    }
     
     const answer = await pc.createAnswer();
+    console.log(`✅ Answer created for ${fromId}`);
+    
     await pc.setLocalDescription(answer);
+    console.log(`✅ Local description set for ${fromId}`);
     
     sendSignalingMessage({
       type: 'answer',
@@ -1510,38 +1644,63 @@ async function handleOffer(fromId, fromUsername, sdp) {
       targetClientId: fromId
     });
     
-    console.log('Sent answer to', fromId);
+    console.log(`📨 Answer sent to ${fromId}`);
   } catch (err) {
-    console.error('Failed to handle offer:', err);
+    console.error(`❌ Failed to handle offer from ${fromId}:`, err);
+    showToast(`Failed to connect to ${fromUsername}`, 'error');
   }
 }
 
 async function handleAnswer(fromId, sdp) {
+  console.log(`📥 Received answer from ${fromId}`);
+  
   const peer = peers[fromId];
   if (!peer) {
-    console.warn('Received answer from unknown peer:', fromId);
+    console.warn(`⚠️ Received answer from unknown peer: ${fromId}`);
     return;
   }
   
   try {
     await peer.pc.setRemoteDescription(new RTCSessionDescription(sdp));
-    console.log('Set remote description for', fromId);
+    console.log(`✅ Remote description set for ${fromId}`);
+    peer.remoteDescriptionSet = true;
+    
+    // Process queued ICE candidates
+    if (peer.iceCandidateQueue.length > 0) {
+      console.log(`🧊 Processing ${peer.iceCandidateQueue.length} queued ICE candidates for ${fromId}`);
+      for (const candidate of peer.iceCandidateQueue) {
+        try {
+          await peer.pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+          console.error(`❌ Failed to add queued candidate for ${fromId}:`, err);
+        }
+      }
+      peer.iceCandidateQueue = [];
+    }
   } catch (err) {
-    console.error('Failed to set remote description:', err);
+    console.error(`❌ Failed to set remote description for ${fromId}:`, err);
   }
 }
 
 async function handleIceCandidate(fromId, candidate) {
   const peer = peers[fromId];
   if (!peer) {
-    console.warn('Received ICE candidate from unknown peer:', fromId);
+    console.warn(`⚠️ Received ICE candidate from unknown peer: ${fromId}`);
     return;
   }
   
+  console.log(`🧊 Received ICE candidate from ${fromId}:`, candidate.type, candidate.protocol);
+  
   try {
-    await peer.pc.addIceCandidate(new RTCIceCandidate(candidate));
+    if (peer.remoteDescriptionSet) {
+      await peer.pc.addIceCandidate(new RTCIceCandidate(candidate));
+      console.log(`✅ ICE candidate added for ${fromId}`);
+    } else {
+      console.log(`⏳ Queueing ICE candidate for ${fromId} (remote description not set yet)`);
+      peer.iceCandidateQueue.push(candidate);
+    }
   } catch (err) {
-    console.error('Failed to add ICE candidate:', err);
+    console.error(`❌ Failed to add ICE candidate for ${fromId}:`, err);
   }
 }
 
@@ -1715,7 +1874,6 @@ function displayChatMessage(username, message, timestamp, isLocal) {
   container.appendChild(msgDiv);
   container.scrollTop = container.scrollHeight;
   
-  // Update unread badge if chat is closed
   const panel = document.getElementById('sidePanel');
   const chatPanel = document.getElementById('chatPanel');
   
@@ -1792,11 +1950,9 @@ function closeSidePanel() {
 }
 
 function showPanelTab(tab) {
-  // Update tabs
   document.getElementById('participantsTab').classList.toggle('active', tab === 'participants');
   document.getElementById('chatTab').classList.toggle('active', tab === 'chat');
   
-  // Update panels
   document.getElementById('participantsPanel').classList.toggle('hidden', tab !== 'participants');
   document.getElementById('chatPanel').classList.toggle('hidden', tab !== 'chat');
   
@@ -1804,7 +1960,6 @@ function showPanelTab(tab) {
     unreadMessages = 0;
     updateChatBadge();
     
-    // Scroll to bottom of chat
     const chatMessages = document.getElementById('chatMessages');
     chatMessages.scrollTop = chatMessages.scrollHeight;
   }
@@ -1816,7 +1971,6 @@ function showMeetingRoom() {
   document.getElementById('meetingRoom').classList.remove('hidden');
   isInMeeting = true;
   
-  // Add self to participants list
   if (clientId && googleUser) {
     addParticipantToList(clientId, googleUser.name);
   }
@@ -1830,32 +1984,32 @@ function showLandingPage() {
 
 // ===== CLEANUP & LEAVE =====
 function removePeer(id) {
-  console.log('Removing peer:', id);
+  console.log(`🗑️ Removing peer: ${id}`);
   
-  // Close peer connection
   if (peers[id]) {
     try {
       peers[id].pc.close();
+      console.log(`✅ Peer connection closed for ${id}`);
     } catch (e) {
       console.error('Error closing peer connection:', e);
     }
     delete peers[id];
   }
   
-  // Remove video element
   removeVideoElement(id);
-  
-  // Remove from participants list
   removeParticipantFromList(id);
 }
 
 function leaveMeeting() {
   if (!confirm('Leave the meeting?')) return;
   
+  console.log('🚪 Leaving meeting...');
+  
   // Close all peer connections
   Object.keys(peers).forEach(id => {
     try {
       peers[id].pc.close();
+      console.log(`✅ Closed peer connection for ${id}`);
     } catch (e) {
       console.error('Error closing peer:', e);
     }
@@ -1867,6 +2021,7 @@ function leaveMeeting() {
     localStream.getTracks().forEach(track => {
       try {
         track.stop();
+        console.log(`⏹️ Stopped ${track.kind} track`);
       } catch (e) {
         console.error('Error stopping track:', e);
       }
@@ -1906,13 +2061,13 @@ function leaveMeeting() {
   if (ws) {
     try {
       ws.close();
+      console.log('✅ WebSocket closed');
     } catch (e) {
       console.error('Error closing WebSocket:', e);
     }
     ws = null;
   }
   
-  // Return to landing page
   showLandingPage();
   showToast('Left the meeting', 'info');
   
@@ -1927,23 +2082,23 @@ function sendSignalingMessage(message) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(message));
   } else {
-    console.error('WebSocket not connected');
+    console.error('❌ WebSocket not connected');
     showToast('Connection lost. Please refresh.', 'error');
   }
 }
 
 // ===== INITIALIZATION =====
 document.addEventListener('DOMContentLoaded', async () => {
-  console.log('Initializing app...');
+  console.log('🚀 Initializing app...');
   
-  // Load ICE servers
+  // Load ICE servers first
   await loadIceServers();
   
   // Initialize Google Sign-In
   try {
     initGoogleSignIn();
   } catch (e) {
-    console.warn('Google Sign-In initialization failed:', e);
+    console.warn('⚠️ Google Sign-In initialization failed:', e);
   }
   
   // Connect to signaling server
@@ -1986,14 +2141,61 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Handle visibility change for quality optimization
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
-      console.log('Page hidden - could reduce quality');
+      console.log('📴 Page hidden - reducing quality');
     } else {
-      console.log('Page visible - restore quality');
+      console.log('📱 Page visible - restoring quality');
     }
   });
   
-  console.log('App initialized successfully');
+  // Monitor connection quality periodically
+  setInterval(() => {
+    if (isInMeeting && Object.keys(peers).length > 0) {
+      monitorConnectionQuality();
+    }
+  }, 5000);
+  
+  console.log('✅ App initialized successfully');
 });
+
+// ===== CONNECTION QUALITY MONITORING =====
+async function monitorConnectionQuality() {
+  for (const [peerId, peer] of Object.entries(peers)) {
+    if (!peer.pc) continue;
+    
+    try {
+      const stats = await peer.pc.getStats();
+      
+      stats.forEach(report => {
+        // Monitor candidate pair for active connection
+        if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+          const transport = report.transportType || 'unknown';
+          
+          // Log if using relay (TURN) - good for troubleshooting
+          if (transport === 'relay') {
+            console.log(`🔄 ${peerId} using TURN relay connection`);
+          } else {
+            console.log(`🎯 ${peerId} using direct connection (${transport})`);
+          }
+        }
+        
+        // Monitor inbound video
+        if (report.type === 'inbound-rtp' && report.kind === 'video') {
+          const packetsLost = report.packetsLost || 0;
+          const packetsReceived = report.packetsReceived || 0;
+          
+          if (packetsReceived > 0) {
+            const lossRate = (packetsLost / (packetsLost + packetsReceived)) * 100;
+            if (lossRate > 5) {
+              console.warn(`⚠️ High packet loss for ${peerId}: ${lossRate.toFixed(2)}%`);
+            }
+          }
+        }
+      });
+    } catch (err) {
+      console.error(`❌ Failed to get stats for ${peerId}:`, err);
+    }
+  }
+}
 
 // ===== EXPOSE FUNCTIONS TO WINDOW =====
 window.createRoom = createRoom;
@@ -2009,3 +2211,4 @@ window.showPanelTab = showPanelTab;
 window.sendChatMessage = sendChatMessage;
 window.toggleParticipantMute = toggleParticipantMute;
 window.muteAll = muteAll;
+window.signOut = signOut;
