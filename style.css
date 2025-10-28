@@ -472,7 +472,7 @@ body {
 }
 
 .controls-center {
-  display: flex;
+  display: flex; /* <-- Add this line */
   gap: 12px;
   align-items: center;
   /* Monomode Glassmorphism */
@@ -998,3 +998,4 @@ body {
   color: var(--text-primary);
   border-color: var(--border-color);
 }
+
