@@ -4,8 +4,10 @@
 // Enhanced main.js with Screen Sharing and Recording Support
 // Enhanced main.js with Real-time Captions & Translation using Web Speech and Gemini
 // ======== Configuration ========
-const WS_URL = "wss://webrtc-meeting-server.onrender.com";      // <--- update to your Render URL
-const ICE_ENDPOINT = "https://webrtc-meeting-server.onrender.com/ice"; // <--- update to your Render URL
+//const WS_URL = "wss://webrtc-meeting-server.onrender.com";      // <--- update to your Render URL
+const WS_URL = "https://just-holly-kanhaiya1610-b072918c.koyeb.app/";
+//const ICE_ENDPOINT = "https://webrtc-meeting-server.onrender.com/ice"; // <--- update to your Render URL
+const ICE_ENDPOINT = "https://just-holly-kanhaiya1610-b072918c.koyeb.app/ice";
 const GOOGLE_CLIENT_ID = "173379398027-i3h11rufg14tpde9rhutp0uvt3imos3k.apps.googleusercontent.com";// <--- set this
 
 // ===== STATE =====
