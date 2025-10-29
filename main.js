@@ -910,12 +910,13 @@
 const WS_URL = "wss://webrtc-meeting-server.onrender.com";      // <--- update to your Render URL
 const ICE_ENDPOINT = "https://webrtc-meeting-server.onrender.com/ice"; // <--- update to your Render URL
 const GOOGLE_CLIENT_ID = "173379398027-i3h11rufg14tpde9rhutp0uvt3imos3k.apps.googleusercontent.com";// <--- set this
-
+// Enhanced main.js with Screen Sharing and Recording Support
 
 // ===== STATE =====
 let googleUser = null;
 let ws = null;
 let localStream = null;
+let screenStream = null; // NEW: Screen sharing stream
 let clientId = null;
 let roomId = null;
 let isAdmin = false;
@@ -924,6 +925,10 @@ let isMuted = false;
 let isAdminMuted = false;
 let isCameraOff = false;
 let handRaised = false;
+let isScreenSharing = false; // NEW: Screen sharing state
+let mediaRecorder = null; // NEW: Recording state
+let recordedChunks = []; // NEW: Recording chunks
+let isRecording = false; // NEW: Recording state
 let peers = {};
 let participantsState = new Map();
 let pcConfig = { 
@@ -1068,28 +1073,11 @@ async function loadIceServers() {
     pcConfig.iceCandidatePoolSize = data.iceCandidatePoolSize || 10;
     
     console.log('✅ ICE servers loaded:', pcConfig.iceServers.length, 'servers');
-    
-    const turnServers = pcConfig.iceServers.filter(s => 
-      s.urls && (Array.isArray(s.urls) ? s.urls : [s.urls]).some(u => u.startsWith('turn'))
-    );
-    console.log('🔄 TURN servers available:', turnServers.length);
-    
   } catch (err) {
     console.error('❌ Failed to fetch ICE servers:', err);
     pcConfig.iceServers = [
-      {
-        urls: ['turn:relay1.expressturn.com:3480'],
-        username: '000000002076989935',
-        credential: 'byPInHD6SuzB8VIXUHdaOwkZlLM='
-      },
-      {
-        urls: ['turn:relay1.expressturn.com:3478'],
-        username: '000000002076989935',
-        credential: 'byPInHD6SuzB8VIXUHdaOwkZlLM='
-      },
       { urls: 'stun:stun.l.google.com:19302' }
     ];
-    console.log('⚠️ Using fallback ICE configuration');
   }
 }
 
@@ -1453,6 +1441,265 @@ async function setupLocalStream() {
   }
 }
 
+// ===== SCREEN SHARING =====
+async function toggleScreenShare() {
+  if (!isScreenSharing) {
+    try {
+      console.log('🖥️ Starting screen share...');
+      
+      screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: {
+          cursor: 'always',
+          displaySurface: 'monitor'
+        },
+        audio: false
+      });
+      
+      const screenTrack = screenStream.getVideoTracks()[0];
+      
+      // Handle screen share stop (user clicks browser stop button)
+      screenTrack.onended = () => {
+        stopScreenShare();
+      };
+      
+      // Replace video track in all peer connections
+      for (const [peerId, peer] of Object.entries(peers)) {
+        if (!peer.pc) continue;
+        
+        const sender = peer.pc.getSenders().find(s => s.track?.kind === 'video');
+        if (sender) {
+          await sender.replaceTrack(screenTrack);
+          console.log(`📤 Replaced video track with screen for ${peerId}`);
+        }
+      }
+      
+      // Update local video
+      const localVideo = document.querySelector(`#video-${clientId} video`);
+      if (localVideo) {
+        localVideo.srcObject = screenStream;
+        localVideo.style.transform = 'none'; // Don't mirror screen share
+      }
+      
+      isScreenSharing = true;
+      updateScreenShareButton();
+      showToast('Screen sharing started', 'success');
+      
+    } catch (err) {
+      console.error('❌ Screen share failed:', err);
+      showToast('Failed to start screen sharing', 'error');
+    }
+  } else {
+    stopScreenShare();
+  }
+}
+
+function stopScreenShare() {
+  if (!screenStream) return;
+  
+  console.log('⏹️ Stopping screen share...');
+  
+  screenStream.getTracks().forEach(track => track.stop());
+  
+  // Replace screen track with camera track in all peer connections
+  if (localStream) {
+    const videoTrack = localStream.getVideoTracks()[0];
+    
+    for (const [peerId, peer] of Object.entries(peers)) {
+      if (!peer.pc) continue;
+      
+      const sender = peer.pc.getSenders().find(s => s.track?.kind === 'video');
+      if (sender && videoTrack) {
+        sender.replaceTrack(videoTrack);
+        console.log(`📤 Restored camera track for ${peerId}`);
+      }
+    }
+    
+    // Restore local video
+    const localVideo = document.querySelector(`#video-${clientId} video`);
+    if (localVideo) {
+      localVideo.srcObject = localStream;
+      localVideo.style.transform = 'scaleX(-1)'; // Mirror camera
+    }
+  }
+  
+  screenStream = null;
+  isScreenSharing = false;
+  updateScreenShareButton();
+  showToast('Screen sharing stopped', 'info');
+}
+
+function updateScreenShareButton() {
+  const btn = document.getElementById('screenShareBtn');
+  if (!btn) return;
+  
+  const icon = btn.querySelector('i');
+  
+  if (isScreenSharing) {
+    icon.className = 'fas fa-stop-circle';
+    btn.classList.add('active');
+    btn.title = 'Stop sharing';
+  } else {
+    icon.className = 'fas fa-desktop';
+    btn.classList.remove('active');
+    btn.title = 'Share screen';
+  }
+}
+
+// ===== RECORDING FUNCTIONALITY =====
+async function toggleRecording() {
+  if (!isRecording) {
+    await startRecording();
+  } else {
+    stopRecording();
+  }
+}
+
+async function startRecording() {
+  try {
+    console.log('🔴 Starting recording...');
+    
+    // Create a stream that combines all video elements
+    const canvas = document.createElement('canvas');
+    canvas.width = 1920;
+    canvas.height = 1080;
+    const ctx = canvas.getContext('2d');
+    
+    // Get the canvas stream
+    const canvasStream = canvas.captureStream(30);
+    
+    // Mix audio from local stream
+    let audioContext;
+    let destination;
+    
+    if (localStream && localStream.getAudioTracks().length > 0) {
+      audioContext = new AudioContext();
+      destination = audioContext.createMediaStreamDestination();
+      
+      // Add local audio
+      const localAudioSource = audioContext.createMediaStreamSource(
+        new MediaStream(localStream.getAudioTracks())
+      );
+      localAudioSource.connect(destination);
+      
+      // Add audio track to canvas stream
+      destination.stream.getAudioTracks().forEach(track => {
+        canvasStream.addTrack(track);
+      });
+    }
+    
+    // Capture the video grid
+    const captureFrame = () => {
+      if (!isRecording) return;
+      
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      
+      const videoGrid = document.getElementById('videoGrid');
+      const videos = videoGrid.querySelectorAll('video');
+      
+      const cols = Math.ceil(Math.sqrt(videos.length));
+      const rows = Math.ceil(videos.length / cols);
+      const videoWidth = canvas.width / cols;
+      const videoHeight = canvas.height / rows;
+      
+      videos.forEach((video, index) => {
+        if (video.readyState === video.HAVE_ENOUGH_DATA) {
+          const col = index % cols;
+          const row = Math.floor(index / cols);
+          const x = col * videoWidth;
+          const y = row * videoHeight;
+          
+          ctx.drawImage(video, x, y, videoWidth, videoHeight);
+        }
+      });
+      
+      requestAnimationFrame(captureFrame);
+    };
+    
+    captureFrame();
+    
+    // Set up MediaRecorder
+    const options = {
+      mimeType: 'video/webm;codecs=vp9,opus',
+      videoBitsPerSecond: 2500000
+    };
+    
+    // Fallback to vp8 if vp9 not supported
+    if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+      options.mimeType = 'video/webm;codecs=vp8,opus';
+    }
+    
+    mediaRecorder = new MediaRecorder(canvasStream, options);
+    recordedChunks = [];
+    
+    mediaRecorder.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        recordedChunks.push(event.data);
+      }
+    };
+    
+    mediaRecorder.onstop = () => {
+      const blob = new Blob(recordedChunks, { type: 'video/webm' });
+      const url = URL.createObjectURL(blob);
+      
+      // Create download link
+      const a = document.createElement('a');
+      a.style.display = 'none';
+      a.href = url;
+      a.download = `meeting-${roomId}-${Date.now()}.webm`;
+      document.body.appendChild(a);
+      a.click();
+      
+      setTimeout(() => {
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }, 100);
+      
+      showToast('Recording saved!', 'success');
+      
+      if (audioContext) {
+        audioContext.close();
+      }
+    };
+    
+    mediaRecorder.start(1000); // Collect data every second
+    isRecording = true;
+    updateRecordingButton();
+    showToast('Recording started', 'success');
+    
+  } catch (err) {
+    console.error('❌ Recording failed:', err);
+    showToast('Failed to start recording', 'error');
+  }
+}
+
+function stopRecording() {
+  if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
+  
+  console.log('⏹️ Stopping recording...');
+  mediaRecorder.stop();
+  isRecording = false;
+  updateRecordingButton();
+  showToast('Recording stopped', 'info');
+}
+
+function updateRecordingButton() {
+  const btn = document.getElementById('recordBtn');
+  if (!btn) return;
+  
+  const icon = btn.querySelector('i');
+  
+  if (isRecording) {
+    icon.className = 'fas fa-stop';
+    btn.classList.add('active', 'recording');
+    btn.title = 'Stop recording';
+  } else {
+    icon.className = 'fas fa-record-vinyl';
+    btn.classList.remove('active', 'recording');
+    btn.title = 'Start recording';
+  }
+}
+
 // ===== VIDEO ELEMENT MANAGEMENT =====
 function addVideoElement(id, stream, isLocal = false, username = 'Participant') {
   let wrapper = document.getElementById(`video-${id}`);
@@ -1531,10 +1778,13 @@ function createPeerConnection(id, username) {
     remoteDescriptionSet: false
   };
   
-  if (localStream) {
-    for (const track of localStream.getTracks()) {
+  // Add appropriate tracks (screen share takes priority)
+  const streamToSend = isScreenSharing ? screenStream : localStream;
+  
+  if (streamToSend) {
+    for (const track of streamToSend.getTracks()) {
       try {
-        pc.addTrack(track, localStream);
+        pc.addTrack(track, streamToSend);
         console.log(`✅ Added ${track.kind} track to peer ${id}`);
       } catch (e) {
         console.error(`❌ Failed to add ${track.kind} track to ${id}:`, e);
@@ -1752,9 +2002,7 @@ function toggleRaiseHand() {
   });
   
   updateRaiseHandButton();
-  
   updateParticipantHandStatus(clientId, handRaised);
-  
   showToast(handRaised ? '✋ Hand raised' : 'Hand lowered', 'info');
 }
 
@@ -2185,6 +2433,16 @@ function leaveMeeting() {
   
   console.log('🚪 Leaving meeting...');
   
+  // Stop recording if active
+  if (isRecording) {
+    stopRecording();
+  }
+  
+  // Stop screen sharing if active
+  if (isScreenSharing) {
+    stopScreenShare();
+  }
+  
   Object.keys(peers).forEach(id => {
     try {
       peers[id].pc.close();
@@ -2324,48 +2582,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
   
-  setInterval(() => {
-    if (isInMeeting && Object.keys(peers).length > 0) {
-      monitorConnectionQuality();
-    }
-  }, 5000);
-  
   console.log('✅ App initialized successfully');
 });
-
-// ===== CONNECTION QUALITY MONITORING =====
-async function monitorConnectionQuality() {
-  for (const [peerId, peer] of Object.entries(peers)) {
-    if (!peer.pc) continue;
-    
-    try {
-      const stats = await peer.pc.getStats();
-      
-      stats.forEach(report => {
-        if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-          const transport = report.transportType || 'unknown';
-          if (transport === 'relay') {
-            console.log(`🔄 ${peerId} using TURN relay connection`);
-          }
-        }
-        
-        if (report.type === 'inbound-rtp' && report.kind === 'video') {
-          const packetsLost = report.packetsLost || 0;
-          const packetsReceived = report.packetsReceived || 0;
-          
-          if (packetsReceived > 0) {
-            const lossRate = (packetsLost / (packetsLost + packetsReceived)) * 100;
-            if (lossRate > 5) {
-              console.warn(`⚠️ High packet loss for ${peerId}: ${lossRate.toFixed(2)}%`);
-            }
-          }
-        }
-      });
-    } catch (err) {
-      console.error(`❌ Failed to get stats for ${peerId}:`, err);
-    }
-  }
-}
 
 // ===== EXPOSE FUNCTIONS TO WINDOW =====
 window.createRoom = createRoom;
@@ -2374,6 +2592,8 @@ window.copyRoomId = copyRoomId;
 window.toggleMic = toggleMic;
 window.toggleCamera = toggleCamera;
 window.toggleRaiseHand = toggleRaiseHand;
+window.toggleScreenShare = toggleScreenShare;
+window.toggleRecording = toggleRecording;
 window.leaveMeeting = leaveMeeting;
 window.endMeeting = endMeeting;
 window.toggleSidePanel = toggleSidePanel;
@@ -2387,4 +2607,4 @@ window.sendUnmuteRequest = sendUnmuteRequest;
 window.approveUnmute = approveUnmute;
 window.closeModal = closeModal;
 window.transferAdmin = transferAdmin;
-window.showTransferAdminModal = showTransferAdminModal;
+window.showTransferAdminModal = showTransferAdminModal
