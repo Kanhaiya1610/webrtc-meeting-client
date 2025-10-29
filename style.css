@@ -388,13 +388,13 @@ body {
 
 /* === NEW: CAPTIONS STYLING === */
 .captions-container {
-  position: absolute;
+  position: relative;
   bottom: 120px;
   left: 50%;
   transform: translateX(-50%);
   width: 80%;
   max-width: 800px;
-  background: rgba(0, 0, 0, 0.9);
+  background: rgba(60, 64, 67, 0.3);
   border-radius: 12px;
   padding: 12px;
   backdrop-filter: blur(10px);
@@ -1149,8 +1149,8 @@ body {
   }
   
   .captions-container {
-    width: 90%;
-    bottom: 100px;
+    width: 70%;
+    position: relative;
   }
 
   .control-btn {
