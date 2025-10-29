@@ -4,10 +4,29 @@
 // Enhanced main.js with Screen Sharing and Recording Support
 // Enhanced main.js with Real-time Captions & Translation using Web Speech and Gemini
 // ======== Configuration ========
-//const WS_URL = "wss://webrtc-meeting-server.onrender.com";      // <--- update to your Render URL
-const WS_URL = "https://just-holly-kanhaiya1610-b072918c.koyeb.app/";
-//const ICE_ENDPOINT = "https://webrtc-meeting-server.onrender.com/ice"; // <--- update to your Render URL
-const ICE_ENDPOINT = "https://just-holly-kanhaiya1610-b072918c.koyeb.app/ice";
+
+// --- NEW: Server Failover Configuration ---
+// This array sets up a Primary/Secondary server system.
+// The app will always try to connect to the first server (index 0).
+// If that server fails to connect or disconnects, it will automatically
+// try to connect to the next server in the list.
+
+const SERVER_ENDPOINTS = [
+  { // --- Primary Server (Koyeb) ---
+    name: "Render",
+    ws: "wss://webrtc-meeting-server.onrender.com",
+    ice: "https://webrtc-meeting-server.onrender.com/ice"
+  },
+  { // --- Secondary Server (Render) ---
+    name: "Koyeb",
+    ws: "wss://just-holly-kanhaiya1610-b072918c.koyeb.app/",
+    ice: "https://just-holly-kanhaiya1610-b072918c.koyeb.app/ice"
+  }
+];
+
+// We will now get WS_URL and ICE_ENDPOINT from the array above.
+let currentServerIndex = 0; // Start with the Primary server
+
 const GOOGLE_CLIENT_ID = "173379398027-i3h11rufg14tpde9rhutp0uvt3imos3k.apps.googleusercontent.com";// <--- set this
 
 // ===== STATE =====
@@ -118,7 +137,8 @@ function updateConnectionStatus(connected) {
   
   if (connected) {
     icon.style.color = 'var(--success-green)';
-    text.textContent = 'Connected';
+    // Show which server we are connected to
+    text.textContent = `Connected (${SERVER_ENDPOINTS[currentServerIndex].name})`;
   } else {
     icon.style.color = 'var(--danger-red)';
     text.textContent = 'Reconnecting...';
@@ -195,21 +215,43 @@ function signOut() {
 
 // ===== ICE SERVER CONFIGURATION =====
 async function loadIceServers() {
+  // NEW: This function will now try the primary server, and
+  // fall back to the secondary if the primary fails.
+  let iceUrl = SERVER_ENDPOINTS[currentServerIndex].ice;
+  let response;
+
   try {
-    console.log('🔧 Loading ICE server configuration...');
-    const res = await fetch(ICE_ENDPOINT);
-    const data = await res.json();
+    console.log(`🔧 Loading ICE config from primary: ${iceUrl}`);
+    response = await fetch(iceUrl);
+    if (!response.ok) throw new Error('Primary ICE server failed');
+  } catch (err) {
+    console.warn(`⚠️ Primary ICE server failed. Trying backup...`);
+    // Fallback to the *other* server
+    const fallbackIndex = (currentServerIndex + 1) % SERVER_ENDPOINTS.length;
+    iceUrl = SERVER_ENDPOINTS[fallbackIndex].ice;
     
+    try {
+      console.log(`🔧 Loading ICE config from backup: ${iceUrl}`);
+      response = await fetch(iceUrl);
+    } catch (fallbackErr) {
+      // If both fail, use a public STUN server as a last resort
+      console.error('❌ Failed to fetch ICE servers from all sources:', fallbackErr);
+      pcConfig.iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
+      return; // Exit the function
+    }
+  }
+
+  // If either fetch succeeded, process the response
+  try {
+    const data = await response.json();
     pcConfig.iceServers = data.iceServers || [];
     pcConfig.iceTransportPolicy = data.iceTransportPolicy || 'all';
     pcConfig.iceCandidatePoolSize = data.iceCandidatePoolSize || 10;
     
     console.log('✅ ICE servers loaded:', pcConfig.iceServers.length, 'servers');
-  } catch (err) {
-    console.error('❌ Failed to fetch ICE servers:', err);
-    pcConfig.iceServers = [
-      { urls: 'stun:stun.l.google.com:19302' }
-    ];
+  } catch (jsonErr) {
+    console.error('❌ Failed to parse ICE server JSON:', jsonErr);
+    pcConfig.iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
   }
 }
 
@@ -220,12 +262,15 @@ function initWebSocket() {
     return;
   }
   
-  ws = new WebSocket(WS_URL);
+  // NEW: Get the WebSocket URL from our endpoints array
+  const currentEndpoint = SERVER_ENDPOINTS[currentServerIndex];
+  console.log(`🔌 Attempting to connect to: ${currentEndpoint.name} (${currentEndpoint.ws})`);
+  ws = new WebSocket(currentEndpoint.ws);
   
   ws.onopen = () => {
-    console.log('✅ WebSocket connected');
+    console.log(`✅ WebSocket connected to ${currentEndpoint.name}`);
     updateConnectionStatus(true);
-    reconnectAttempts = 0;
+    reconnectAttempts = 0; // Reset attempts on a successful connection
   };
   
   ws.onmessage = async (evt) => {
@@ -238,18 +283,45 @@ function initWebSocket() {
   };
   
   ws.onerror = (err) => {
-    console.error('❌ WebSocket error:', err);
+    console.error(`❌ WebSocket error on ${currentEndpoint.name}:`, err);
     updateConnectionStatus(false);
+    // Don't try to failover here, onclose will handle it
   };
   
   ws.onclose = () => {
-    console.log('⚠️ WebSocket closed');
+    console.log(`⚠️ WebSocket closed from ${currentEndpoint.name}`);
     updateConnectionStatus(false);
     
-    if (isInMeeting && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-      reconnectAttempts++;
-      showToast(`Reconnecting... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`, 'info');
-      setTimeout(() => initWebSocket(), 2000 * reconnectAttempts);
+    // NEW: Failover and Reconnect Logic
+    if (isInMeeting) {
+      // If we are in a meeting, try to reconnect to the *same* server first.
+      if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+        reconnectAttempts++;
+        showToast(`Reconnecting to ${currentEndpoint.name}... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`, 'info');
+        setTimeout(initWebSocket, 2000 * reconnectAttempts);
+      } 
+      // If reconnects fail, try the *next* server.
+      else if (currentServerIndex + 1 < SERVER_ENDPOINTS.length) {
+        currentServerIndex++; // Move to the next server in the array
+        reconnectAttempts = 0; // Reset attempts for the new server
+        showToast(`Connection to ${currentEndpoint.name} failed. Trying backup server...`, 'error');
+        initWebSocket(); // This will now use the new `currentServerIndex`
+      } 
+      // If all servers have failed, stop trying.
+      else {
+        showToast('All servers are unresponsive. Please refresh to try again.', 'error');
+      }
+    } 
+    // If not in a meeting (i.e., initial connection failed)
+    else if (currentServerIndex + 1 < SERVER_ENDPOINTS.length) {
+      currentServerIndex++;
+      reconnectAttempts = 0;
+      showToast(`Primary server is down. Trying backup server...`, 'info');
+      initWebSocket();
+    }
+    // If all servers fail on initial load
+    else {
+      showToast('All servers are unavailable. Please try again later.', 'error');
     }
   };
 }
