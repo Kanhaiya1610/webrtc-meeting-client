@@ -85,6 +85,19 @@
         <!-- Videos will be added here dynamically -->
       </div>
       
+      <!-- NEW: Captions Container -->
+      <div id="captionsContainer" class="captions-container hidden">
+        <div class="captions-header">
+          <span>Live Captions</span>
+          <button class="btn-icon-small" onclick="showCaptionSettings()" title="Caption Settings">
+            <i class="fas fa-cog"></i>
+          </button>
+        </div>
+        <div id="captionsDisplay" class="captions-display">
+          <!-- Live captions will appear here -->
+        </div>
+      </div>
+      
       <!-- Connection Quality Indicator -->
       <div id="qualityIndicator" class="quality-indicator hidden">
         <i class="fas fa-signal"></i>
@@ -111,14 +124,17 @@
           <i class="far fa-hand-paper"></i>
         </button>
         
-        <!-- NEW: Screen Share Button -->
         <button class="control-btn" id="screenShareBtn" onclick="toggleScreenShare()" title="Share screen">
           <i class="fas fa-desktop"></i>
         </button>
         
-        <!-- NEW: Recording Button -->
         <button class="control-btn" id="recordBtn" onclick="toggleRecording()" title="Start recording">
           <i class="fas fa-record-vinyl"></i>
+        </button>
+        
+        <!-- NEW: Captions Button -->
+        <button class="control-btn" id="captionsBtn" onclick="toggleCaptions()" title="Turn on captions">
+          <i class="far fa-closed-captioning"></i>
         </button>
         
         <button class="control-btn" onclick="toggleSidePanel('chat')" title="Chat">
