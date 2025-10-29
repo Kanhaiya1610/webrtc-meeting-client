@@ -2,7 +2,7 @@
 // Features: Raise Hand, Unmute Requests, Selective Unmute, Admin Transfer
 // frontend/main.js - Enhanced with robust WebRTC connectivity
 // Enhanced main.js with Screen Sharing and Recording Support
-// Enhanced main.js with Real-time Captions using Web Speech API
+// Enhanced main.js with Real-time Captions & Translation using Web Speech and Gemini
 // ======== Configuration ========
 const WS_URL = "wss://webrtc-meeting-server.onrender.com";      // <--- update to your Render URL
 const ICE_ENDPOINT = "https://webrtc-meeting-server.onrender.com/ice"; // <--- update to your Render URL
@@ -38,12 +38,15 @@ const MAX_RECONNECT_ATTEMPTS = 5;
 let unreadMessages = 0;
 let isInMeeting = false;
 
-// ===== NEW: CAPTIONS STATE =====
+// ===== NEW: CAPTIONS & TRANSLATION STATE =====
 let captionsEnabled = false;
 let recognition = null;
-let captionLanguage = 'en-US';
+let captionLanguage = 'en-US'; // The language I *speak*
+let myPreferredLanguage = 'en-US'; // The language I *want to read*
 let captionHistory = [];
 const MAX_CAPTION_HISTORY = 50;
+let translationCache = new Map(); // Caches interim translations
+let translationTimeout = null; // Debouncer for interim translations
 
 // Available languages for captions
 const CAPTION_LANGUAGES = {
@@ -392,10 +395,11 @@ async function handleSignalingMessage(data) {
       displayChatMessage(data.fromUsername, data.message, data.timestamp, data.fromClientId === clientId);
       break;
       
-    // NEW: Handle caption messages
+    // NEW: Handle caption messages with translation
     case 'caption':
-      if (captionsEnabled && data.fromClientId !== clientId) {
-        displayCaption(data.fromUsername, data.text, data.isFinal);
+      if (captionsEnabled) {
+        // Pass to displayCaption, which now handles translation logic
+        displayCaption(data.fromUsername, data.text, data.isFinal, data.language);
       }
       break;
       
@@ -421,7 +425,175 @@ async function handleSignalingMessage(data) {
   }
 }
 
-// ===== NEW: CAPTIONS FUNCTIONALITY =====
+// ===== NEW: CAPTIONS & TRANSLATION FUNCTIONALITY =====
+
+/**
+ * Calls the Gemini API to translate text.
+ */
+async function translateText(text, sourceLang, targetLang, callback) {
+  // Use API key provided by the environment
+  const apiKey = ""; 
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+  
+  // Get full language names for a better prompt
+  const sourceLangName = CAPTION_LANGUAGES[sourceLang] || sourceLang;
+  const targetLangName = CAPTION_LANGUAGES[targetLang] || targetLang;
+
+  const prompt = `Translate the following text from ${sourceLangName} to ${targetLangName}. Respond with *only* the translated text, no other commentary, labels, or quotation marks: "${text}"`;
+
+  try {
+    // Use exponential backoff for retries
+    let response;
+    let delay = 1000;
+    for (let i = 0; i < 3; i++) { // Retry up to 3 times
+      response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+        })
+      });
+
+      if (response.ok) {
+        break; // Success
+      } else if (response.status === 429) { // Throttling
+        await new Promise(resolve => setTimeout(resolve, delay));
+        delay *= 2;
+      } else {
+        throw new Error(`API error: ${response.status} ${response.statusText}`);
+      }
+    }
+
+    if (!response.ok) {
+      throw new Error('Translation failed after retries');
+    }
+
+    const result = await response.json();
+    const candidate = result.candidates?.[0];
+    let translatedText = candidate?.content?.parts?.[0]?.text;
+
+    if (translatedText) {
+      // Clean the response (model might add quotes or labels despite prompt)
+      translatedText = translatedText.trim().replace(/^"|"$/g, '');
+      callback(translatedText);
+    } else {
+      throw new Error('Invalid API response structure');
+    }
+  } catch (error) {
+    console.error('Translation failed:', error);
+    callback(`${text} (Translation failed)`); // Fallback to original text
+  }
+}
+
+/**
+ * Renders the caption text to the DOM.
+ * This is the final step, whether translated or not.
+ */
+function renderCaption(username, text, isFinal) {
+  const container = document.getElementById('captionsDisplay');
+  // Use a consistent ID for the speaker
+  const captionId = `caption-${username.replace(/\s+/g, '-')}`;
+  let captionElement = document.getElementById(captionId);
+
+  // Create new element if one for this speaker doesn't exist
+  if (!captionElement) {
+    captionElement = document.createElement('div');
+    captionElement.id = captionId;
+    captionElement.className = 'caption-item';
+    container.appendChild(captionElement);
+  }
+
+  const isOwnCaption = username === googleUser?.name;
+
+  // Update the content
+  captionElement.innerHTML = `
+    <span class="caption-speaker ${isOwnCaption ? 'own' : ''}">${username}:</span>
+    <span class="caption-text ${isFinal ? 'final' : 'interim'}">${escapeHtml(text)}</span>
+  `;
+
+  if (isFinal) {
+    // Add to history
+    captionHistory.push({
+      username,
+      text, // Store the final (possibly translated) text
+      timestamp: Date.now()
+    });
+    
+    // Limit history size
+    if (captionHistory.length > MAX_CAPTION_HISTORY) {
+      captionHistory.shift();
+    }
+    
+    // Remove final caption after a delay
+    setTimeout(() => {
+      if (captionElement && captionElement.querySelector('.caption-text.final')) {
+        captionElement.style.opacity = '0';
+        setTimeout(() => {
+          if (captionElement) captionElement.remove();
+        }, 500);
+      }
+    }, 3000); // Fade out after 3 seconds
+  }
+
+  // Auto-scroll to bottom
+  container.scrollTop = container.scrollHeight;
+}
+
+/**
+ * Main logic to display captions.
+ * Decides if translation is needed and handles interim/final results.
+ */
+function displayCaption(username, text, isFinal, sourceLanguage = 'en-US') {
+  const isOwnCaption = username === googleUser?.name;
+  const needsTranslation = !isOwnCaption && sourceLanguage && sourceLanguage !== myPreferredLanguage;
+
+  if (!needsTranslation) {
+    // No translation needed, just render it
+    renderCaption(username, text, isFinal);
+    return;
+  }
+
+  // --- Translation is Needed ---
+
+  if (isFinal) {
+    // Final text: Clear any pending interim translations and translate this.
+    clearTimeout(translationTimeout);
+    translationTimeout = null;
+    translationCache.delete(username); // Clear cache for this user
+
+    // Show a placeholder with the *original* text while translating
+    renderCaption(username, `${text} (Translating...)`, false); 
+
+    translateText(text, sourceLanguage, myPreferredLanguage, (translatedText) => {
+      renderCaption(username, translatedText, true); // Show final translation
+    });
+
+  } else {
+    // Interim text: Cache it and set a debounce timer.
+    // This prevents hammering the API for every single interim word.
+    translationCache.set(username, text);
+
+    if (translationTimeout) {
+      clearTimeout(translationTimeout);
+    }
+
+    // Show interim in original language (faded)
+    renderCaption(username, text, false);
+
+    translationTimeout = setTimeout(() => {
+      const cachedText = translationCache.get(username);
+      if (cachedText) {
+        translateText(cachedText, sourceLanguage, myPreferredLanguage, (translatedText) => {
+          // Render this interim translation, but mark it as interim (faded)
+          renderCaption(username, translatedText, false);
+        });
+        translationCache.delete(username);
+      }
+    }, 1000); // Wait 1 second after last interim result before translating
+  }
+}
+
+
 function initSpeechRecognition() {
   // Check browser support
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -435,7 +607,7 @@ function initSpeechRecognition() {
   recognition = new SpeechRecognition();
   recognition.continuous = true;
   recognition.interimResults = true;
-  recognition.lang = captionLanguage;
+  recognition.lang = captionLanguage; // Use the language I'm speaking
   recognition.maxAlternatives = 1;
   
   recognition.onstart = () => {
@@ -459,11 +631,13 @@ function initSpeechRecognition() {
     if (finalTranscript) {
       // Send final caption to all participants
       sendCaption(finalTranscript.trim(), true);
-      displayCaption(googleUser.name, finalTranscript.trim(), true);
+      // Display my own caption
+      renderCaption(googleUser.name, finalTranscript.trim(), true);
     } else if (interimTranscript) {
       // Send interim caption (real-time)
       sendCaption(interimTranscript.trim(), false);
-      displayCaption(googleUser.name, interimTranscript.trim(), false);
+      // Display my own interim caption
+      renderCaption(googleUser.name, interimTranscript.trim(), false);
     }
   };
   
@@ -534,7 +708,7 @@ function startCaptions() {
     // Show captions container
     document.getElementById('captionsContainer').classList.remove('hidden');
     
-    showToast(`Captions started (${CAPTION_LANGUAGES[captionLanguage]})`, 'success');
+    showToast(`Captions started (Speaking ${CAPTION_LANGUAGES[captionLanguage]})`, 'success');
   } catch (err) {
     console.error('Failed to start captions:', err);
     showToast('Failed to start captions', 'error');
@@ -566,56 +740,8 @@ function sendCaption(text, isFinal) {
     type: 'caption',
     text: text,
     isFinal: isFinal,
-    language: captionLanguage
+    language: captionLanguage // Send the language I'm speaking
   });
-}
-
-function displayCaption(username, text, isFinal) {
-  const container = document.getElementById('captionsDisplay');
-  const captionId = `caption-${username.replace(/\s+/g, '-')}`;
-  
-  let captionElement = document.getElementById(captionId);
-  
-  if (!captionElement) {
-    captionElement = document.createElement('div');
-    captionElement.id = captionId;
-    captionElement.className = 'caption-item';
-    container.appendChild(captionElement);
-  }
-  
-  const isOwnCaption = username === googleUser?.name;
-  
-  captionElement.innerHTML = `
-    <span class="caption-speaker ${isOwnCaption ? 'own' : ''}">${username}:</span>
-    <span class="caption-text ${isFinal ? 'final' : 'interim'}">${escapeHtml(text)}</span>
-  `;
-  
-  if (isFinal) {
-    // Add to history
-    captionHistory.push({
-      username,
-      text,
-      timestamp: Date.now()
-    });
-    
-    // Limit history size
-    if (captionHistory.length > MAX_CAPTION_HISTORY) {
-      captionHistory.shift();
-    }
-    
-    // Remove interim caption after a delay
-    setTimeout(() => {
-      if (captionElement && captionElement.querySelector('.caption-text.final')) {
-        captionElement.style.opacity = '0';
-        setTimeout(() => {
-          if (captionElement) captionElement.remove();
-        }, 500);
-      }
-    }, 3000);
-  }
-  
-  // Auto-scroll to bottom
-  container.scrollTop = container.scrollHeight;
 }
 
 function clearCaptions() {
@@ -648,28 +774,38 @@ function showCaptionSettings() {
   for (const [code, name] of Object.entries(CAPTION_LANGUAGES)) {
     languageOptions += `<option value="${code}" ${code === captionLanguage ? 'selected' : ''}>${name}</option>`;
   }
+
+  // Create options for preferred language
+  let preferredLanguageOptions = '';
+  for (const [code, name] of Object.entries(CAPTION_LANGUAGES)) {
+    preferredLanguageOptions += `<option value="${code}" ${code === myPreferredLanguage ? 'selected' : ''}>${name}</option>`;
+  }
   
   modal.innerHTML = `
     <div class="modal-content">
       <h3>Caption Settings</h3>
+      
       <div class="settings-group">
-        <label for="captionLanguageSelect">Caption Language</label>
+        <label for="captionLanguageSelect">Spoken Language (What I speak)</label>
         <select id="captionLanguageSelect" class="settings-select">
           ${languageOptions}
         </select>
       </div>
+
       <div class="settings-group">
-        <label>
-          <input type="checkbox" id="showTimestamps" />
-          Show timestamps
-        </label>
+        <label for="preferredLanguageSelect">Translation (What I read)</label>
+        <select id="preferredLanguageSelect" class="settings-select">
+          ${preferredLanguageOptions}
+        </select>
       </div>
+      
       <div class="settings-group">
         <button class="btn-secondary" onclick="downloadCaptionHistory()">
           <i class="fas fa-download"></i>
           Download Caption History
         </button>
       </div>
+      
       <div class="modal-actions">
         <button class="btn-secondary" onclick="closeModal(this)">Cancel</button>
         <button class="btn-primary" onclick="applyCaptionSettings(); closeModal(this);">Apply</button>
@@ -681,8 +817,13 @@ function showCaptionSettings() {
 }
 
 function applyCaptionSettings() {
-  const select = document.getElementById('captionLanguageSelect');
-  const newLang = select.value;
+  const selectLang = document.getElementById('captionLanguageSelect');
+  const newLang = selectLang.value;
+  
+  const selectPreferred = document.getElementById('preferredLanguageSelect');
+  const newPreferredLang = selectPreferred.value;
+
+  myPreferredLanguage = newPreferredLang;
   
   if (newLang !== captionLanguage) {
     captionLanguage = newLang;
@@ -693,12 +834,11 @@ function applyCaptionSettings() {
       setTimeout(() => {
         recognition.lang = captionLanguage;
         recognition.start();
-        showToast(`Language changed to ${CAPTION_LANGUAGES[captionLanguage]}`, 'success');
       }, 500);
-    } else {
-      showToast(`Caption language set to ${CAPTION_LANGUAGES[captionLanguage]}`, 'success');
     }
   }
+
+  showToast(`Settings updated: Speaking ${CAPTION_LANGUAGES[captionLanguage]}, Reading ${CAPTION_LANGUAGES[myPreferredLanguage]}`, 'success');
 }
 
 function downloadCaptionHistory() {
@@ -708,7 +848,8 @@ function downloadCaptionHistory() {
   }
   
   let content = `Meeting Captions - Room ${roomId}\n`;
-  content += `Generated: ${new Date().toLocaleString()}\n\n`;
+  content += `Generated: ${new Date().toLocaleString()}\n`;
+  content += `(Captions shown in your preferred language: ${CAPTION_LANGUAGES[myPreferredLanguage]})\n\n`;
   content += '='.repeat(50) + '\n\n';
   
   captionHistory.forEach(item => {
