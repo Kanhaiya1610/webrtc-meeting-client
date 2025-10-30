@@ -13,14 +13,14 @@
 
 const SERVER_ENDPOINTS = [
   { // --- Primary Server (Koyeb) ---
-    name: "Render",
-    ws: "wss://webrtc-meeting-server.onrender.com",
-    ice: "https://webrtc-meeting-server.onrender.com/ice"
-  },
-  { // --- Secondary Server (Render) ---
     name: "Koyeb",
     ws: "wss://just-holly-kanhaiya1610-b072918c.koyeb.app/",
     ice: "https://just-holly-kanhaiya1610-b072918c.koyeb.app/ice"
+  },
+  { // --- Secondary Server (Render) ---
+    name: "Render",
+    ws: "wss://webrtc-meeting-server.onrender.com",
+    ice: "https://webrtc-meeting-server.onrender.com/ice"
   }
 ];
 
