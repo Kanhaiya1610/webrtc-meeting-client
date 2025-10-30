@@ -502,18 +502,15 @@ async function handleSignalingMessage(data) {
 // ===== NEW: CAPTIONS & TRANSLATION FUNCTIONALITY =====
 
 /**
- * Calls the Gemini API to translate text.
+ * Calls our backend proxy to translate text.
  */
 async function translateText(text, sourceLang, targetLang, callback) {
-  // Use API key provided by the environment
-  const apiKey = ""; 
-  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+  // *** MODIFICATION: API Key Removed ***
+  // The API key is no longer here. We call our own backend.
   
-  // Get full language names for a better prompt
-  const sourceLangName = CAPTION_LANGUAGES[sourceLang] || sourceLang;
-  const targetLangName = CAPTION_LANGUAGES[targetLang] || targetLang;
-
-  const prompt = `Translate the following text from ${sourceLangName} to ${targetLangName}. Respond with *only* the translated text, no other commentary, labels, or quotation marks: "${text}"`;
+  // Get the base URL (e.g., "https://just-holly-kanhaiya1610-b072918c.koyeb.app")
+  const baseUrl = SERVER_ENDPOINTS[currentServerIndex].ice.replace('/ice', '');
+  const apiUrl = `${baseUrl}/translate`;
 
   try {
     // Use exponential backoff for retries
@@ -523,8 +520,11 @@ async function translateText(text, sourceLang, targetLang, callback) {
       response = await fetch(apiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        // *** MODIFICATION: Send raw text data, not a Gemini payload ***
         body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
+          text,
+          sourceLang,
+          targetLang
         })
       });
 
@@ -542,16 +542,14 @@ async function translateText(text, sourceLang, targetLang, callback) {
       throw new Error('Translation failed after retries');
     }
 
+    // *** MODIFICATION: Expect simple JSON { translatedText: "..." } from our server ***
     const result = await response.json();
-    const candidate = result.candidates?.[0];
-    let translatedText = candidate?.content?.parts?.[0]?.text;
+    const translatedText = result.translatedText;
 
     if (translatedText) {
-      // Clean the response (model might add quotes or labels despite prompt)
-      translatedText = translatedText.trim().replace(/^"|"$/g, '');
       callback(translatedText);
     } else {
-      throw new Error('Invalid API response structure');
+      throw new Error(result.error || 'Invalid API response structure');
     }
   } catch (error) {
     console.error('Translation failed:', error);
