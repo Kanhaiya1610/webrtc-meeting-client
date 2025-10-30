@@ -477,6 +477,32 @@ body {
   opacity: 1;
 }
 
+/* Fade-in / Fade-out support for captions
+   - Adds transitions on opacity & transform so showing/hiding the
+     captions container animates smoothly.
+   - Provides a more specific override for .hidden so existing JS
+     that toggles the global .hidden class will trigger the CSS
+     transition instead of instantly removing the element.
+*/
+.captions-container {
+  transition: opacity 0.28s ease, transform 0.28s ease, visibility 0.28s;
+  opacity: 1;
+  visibility: visible;
+}
+
+/* When JS toggles the global .hidden class, this selector is more
+   specific and will override the generic .hidden { display: none !important; }
+   allowing the captions to fade out. After the transition completes
+   you may optionally set display:none from JS if required. */
+.captions-container.hidden,
+.captions-container[aria-hidden="true"] {
+  display: block !important; /* override generic .hidden */
+  opacity: 0;
+  transform: translateX(-50%) translateY(12px);
+  pointer-events: none;
+  visibility: hidden;
+}
+
 /* === Settings Modal Additions === */
 .settings-group {
   margin-bottom: 20px;
