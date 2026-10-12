@@ -17,6 +17,6 @@ const localEndpoints = ['localhost', '127.0.0.1'].includes(window.location.hostn
   : configuredEndpoints;
 
 window.APP_CONFIG = {
-  googleClientId: '173379398027-i3h11rufg14tpde9rhutp0uvt3imos3k.apps.googleusercontent.com',
+  googleClientId: '541297227204-kedmp4uiua8r3i7vg382qtpcmpkh2ttu.apps.googleusercontent.com',
   endpoints: localEndpoints
 };
