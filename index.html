@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#202124" />
   <title>Meet Clone – Real-time Video Platform</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
   <link rel="stylesheet" href="style.css" />
@@ -19,8 +20,8 @@
       </div>
       
       <div class="auth-card">
-        <div id="gSignInDiv" class="google-signin"></div>
-        <p id="authStatus" class="auth-status">Sign in to continue</p>
+        <div id="gSignInDiv" class="google-signin" aria-label="Sign in with Google"></div>
+        <p id="authStatus" class="auth-status" aria-live="polite">Sign in to continue</p>
         
         <div id="afterAuth" class="after-auth hidden">
           <div class="user-info">
@@ -37,6 +38,7 @@
               New Meeting
             </button>
             <div class="join-section">
+              <label class="sr-only" for="roomIdInput">Meeting code</label>
               <input type="text" id="roomIdInput" placeholder="Enter meeting code" maxlength="8" />
               <button class="btn-secondary" onclick="joinRoomPrompt()">
                 <i class="fas fa-sign-in-alt"></i>
@@ -65,15 +67,15 @@
       </div>
       
       <div class="header-right">
-        <div class="connection-status" id="connectionStatus">
+        <div class="connection-status" id="connectionStatus" role="status" aria-live="polite">
           <i class="fas fa-circle"></i>
           <span>Connected</span>
         </div>
-        <div class="participant-count" onclick="toggleSidePanel('participants')">
+        <button type="button" class="participant-count" onclick="toggleSidePanel('participants')" aria-label="Open participants">
           <i class="fas fa-users"></i>
           <span id="participantCountBadge">1</span>
-        </div>
-        <button class="btn-icon" onclick="signOut()" title="Sign Out">
+        </button>
+        <button class="btn-icon" onclick="signOut()" title="Sign Out" aria-label="Sign out">
           <i class="fas fa-sign-out-alt"></i>
         </button>
       </div>
@@ -86,7 +88,7 @@
       </div>
       
       <!-- NEW: Captions Container -->
-      <div id="captionsContainer" class="captions-container hidden">
+        <div id="captionsContainer" class="captions-container hidden" role="log" aria-live="polite" aria-label="Live captions">
         <div class="captions-header">
           <span>Live Captions</span>
           <button class="btn-icon-small" onclick="showCaptionSettings()" title="Caption Settings">
@@ -106,54 +108,54 @@
     </div>
 
     <!-- Controls Bar -->
-    <div class="controls-bar">
+    <div class="controls-bar" role="toolbar" aria-label="Meeting controls">
       <div class="controls-center">
-        <button class="control-btn" id="toggleMicBtn" onclick="toggleMic()" title="Mute/Unmute">
+        <button class="control-btn" id="toggleMicBtn" onclick="toggleMic()" title="Mute/Unmute" aria-label="Mute or unmute microphone">
           <i class="fas fa-microphone" id="micIcon"></i>
         </button>
         
-        <button class="control-btn" id="toggleCamBtn" onclick="toggleCamera()" title="Camera On/Off">
+        <button class="control-btn" id="toggleCamBtn" onclick="toggleCamera()" title="Camera On/Off" aria-label="Turn camera on or off">
           <i class="fas fa-video" id="camIcon"></i>
         </button>
         
-        <button class="control-btn btn-danger" onclick="leaveMeeting()" title="Leave Meeting">
+        <button class="control-btn btn-danger" onclick="leaveMeeting()" title="Leave Meeting" aria-label="Leave meeting">
           <i class="fas fa-phone-slash"></i>
         </button>
         
-        <button class="control-btn hidden" id="raiseHandBtn" onclick="toggleRaiseHand()" title="Raise Hand">
+        <button class="control-btn hidden" id="raiseHandBtn" onclick="toggleRaiseHand()" title="Raise Hand" aria-label="Raise or lower hand">
           <i class="far fa-hand-paper"></i>
         </button>
         
-        <button class="control-btn" id="screenShareBtn" onclick="toggleScreenShare()" title="Share screen">
+        <button class="control-btn" id="screenShareBtn" onclick="toggleScreenShare()" title="Share screen" aria-label="Share or stop sharing screen">
           <i class="fas fa-desktop"></i>
         </button>
         
-        <button class="control-btn" id="recordBtn" onclick="toggleRecording()" title="Start recording">
+        <button class="control-btn" id="recordBtn" onclick="toggleRecording()" title="Start recording" aria-label="Start or stop recording">
           <i class="fas fa-record-vinyl"></i>
         </button>
         
         <!-- NEW: Captions Button -->
-        <button class="control-btn" id="captionsBtn" onclick="toggleCaptions()" title="Turn on captions">
+        <button class="control-btn" id="captionsBtn" onclick="toggleCaptions()" title="Turn on captions" aria-label="Turn live captions on or off">
           <i class="far fa-closed-captioning"></i>
         </button>
         
-        <button class="control-btn" onclick="toggleSidePanel('chat')" title="Chat">
+        <button class="control-btn" onclick="toggleSidePanel('chat')" title="Chat" aria-label="Open chat">
           <i class="fas fa-comment"></i>
           <span class="notification-badge hidden" id="chatNotificationBadge">0</span>
         </button>
         
-        <button class="control-btn" onclick="toggleSidePanel('participants')" title="Participants">
+        <button class="control-btn" onclick="toggleSidePanel('participants')" title="Participants" aria-label="Open participants">
           <i class="fas fa-users"></i>
         </button>
         
-        <button class="control-btn hidden" id="endMeetingBtn" onclick="endMeeting()" title="End Meeting for All">
+        <button class="control-btn hidden" id="endMeetingBtn" onclick="endMeeting()" title="End Meeting for All" aria-label="End meeting for everyone">
           <i class="fas fa-stop-circle"></i>
         </button>
       </div>
     </div>
 
     <!-- Side Panel -->
-    <div id="sidePanel" class="side-panel">
+    <aside id="sidePanel" class="side-panel" role="dialog" aria-label="Meeting details" aria-modal="false">
       <div class="panel-header">
         <div class="panel-tabs">
           <button class="tab-btn active" id="participantsTab" onclick="showPanelTab('participants')">
@@ -165,7 +167,7 @@
             Chat
           </button>
         </div>
-        <button class="close-panel" onclick="closeSidePanel()">
+        <button class="close-panel" onclick="closeSidePanel()" aria-label="Close meeting details">
           <i class="fas fa-times"></i>
         </button>
       </div>
@@ -189,24 +191,26 @@
           <!-- Chat messages will appear here -->
         </div>
         <div class="chat-input-container">
-          <textarea id="chatInput" placeholder="Send a message..." rows="1"></textarea>
-          <button class="send-btn" onclick="sendChatMessage()">
+          <label class="sr-only" for="chatInput">Chat message</label>
+          <textarea id="chatInput" placeholder="Send a message..." rows="1" aria-label="Chat message"></textarea>
+          <button class="send-btn" onclick="sendChatMessage()" aria-label="Send chat message">
             <i class="fas fa-paper-plane"></i>
           </button>
         </div>
       </div>
-    </div>
+    </aside>
   </div>
 
   <!-- Loading Overlay -->
-  <div id="loadingOverlay" class="loading-overlay hidden">
+  <div id="loadingOverlay" class="loading-overlay hidden" role="status" aria-live="assertive">
     <div class="loading-spinner"></div>
     <p id="loadingText">Connecting...</p>
   </div>
 
   <!-- Toast Notifications -->
-  <div id="toastContainer" class="toast-container"></div>
+  <div id="toastContainer" class="toast-container" role="status" aria-live="polite"></div>
 
+  <script src="config.js"></script>
   <script src="main.js"></script>
 </body>
 </html>

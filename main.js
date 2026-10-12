@@ -4,38 +4,28 @@
 // Enhanced main.js with Screen Sharing and Recording Support
 // Enhanced main.js with Real-time Captions & Translation using Web Speech and Gemini
 // ======== Configuration ========
-
-// --- NEW: Server Failover Configuration ---
-// This array sets up a Primary/Secondary server system.
-// The app will always try to connect to the first server (index 0).
-// If that server fails to connect or disconnects, it will automatically
-// try to connect to the next server in the list.
-
-const SERVER_ENDPOINTS = [
-  { // --- Primary Server (Koyeb) ---
-    name: "Render",
-    ws: "wss://webrtc-meeting-server.onrender.com",
-    ice: "https://webrtc-meeting-server.onrender.com/ice"
-  },
-  { // --- Secondary Server (Render) ---
-    name: "Koyeb",
-    ws: "wss://just-holly-kanhaiya1610-b072918c.koyeb.app/",
-    ice: "https://just-holly-kanhaiya1610-b072918c.koyeb.app/ice"
-  }
-];
-
-// We will now get WS_URL and ICE_ENDPOINT from the array above.
+const APP_CONFIG = window.APP_CONFIG || {};
+const SERVER_ENDPOINTS = (APP_CONFIG.endpoints || []).map(endpoint => ({
+  ...endpoint,
+  baseUrl: String(endpoint.baseUrl || '').replace(/\/$/, ''),
+  ws: endpoint.ws || `${String(endpoint.baseUrl || '').replace(/^http/, 'ws').replace(/\/$/, '')}/ws`,
+  ice: endpoint.ice || `${String(endpoint.baseUrl || '').replace(/\/$/, '')}/ice`,
+  translate: endpoint.translate || `${String(endpoint.baseUrl || '').replace(/\/$/, '')}/translate`
+})).filter(endpoint => endpoint.baseUrl && endpoint.ws);
 let currentServerIndex = 0; // Start with the Primary server
 
-const GOOGLE_CLIENT_ID = "173379398027-i3h11rufg14tpde9rhutp0uvt3imos3k.apps.googleusercontent.com";// <--- set this
+const GOOGLE_CLIENT_ID = APP_CONFIG.googleClientId || '';
 
 // ===== STATE =====
 let googleUser = null;
+let googleCredential = null;
+let sessionToken = null;
 let ws = null;
 let localStream = null;
 let screenStream = null;
 let clientId = null;
 let roomId = null;
+let resumeToken = null;
 let isAdmin = false;
 let adminToken = null;
 let isMuted = false;
@@ -46,6 +36,7 @@ let isScreenSharing = false;
 let mediaRecorder = null;
 let recordedChunks = [];
 let isRecording = false;
+let recordingFrameId = null;
 let peers = {};
 let participantsState = new Map();
 let pcConfig = { 
@@ -58,6 +49,10 @@ let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
 let unreadMessages = 0;
 let isInMeeting = false;
+let intentionalSocketClose = false;
+let reconnectTimer = null;
+let roomActionPending = null;
+let googleInitAttempts = 0;
 
 // ===== NEW: CAPTIONS & TRANSLATION STATE =====
 let captionsEnabled = false;
@@ -67,7 +62,7 @@ let myPreferredLanguage = 'en-US'; // The language I *want to read*
 let captionHistory = [];
 const MAX_CAPTION_HISTORY = 50;
 let translationCache = new Map(); // Caches interim translations
-let translationTimeout = null; // Debouncer for interim translations
+let translationTimeouts = new Map(); // Debouncer for interim translations per speaker
 
 // Available languages for captions
 const CAPTION_LANGUAGES = {
@@ -94,23 +89,16 @@ const CAPTION_LANGUAGES = {
 };
 
 // ===== UTILITY FUNCTIONS =====
-function parseJwt(token) {
-  const base64Url = token.split('.')[1];
-  const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
-  const jsonPayload = decodeURIComponent(atob(base64).split('').map(c => {
-    return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
-  }).join(''));
-  return JSON.parse(jsonPayload);
-}
-
 function showToast(message, type = 'info') {
   const container = document.getElementById('toastContainer');
+  if (!container) return;
   const toast = document.createElement('div');
   toast.className = `toast ${type}`;
-  toast.innerHTML = `
-    <i class="fas fa-${type === 'success' ? 'check-circle' : type === 'error' ? 'exclamation-circle' : 'info-circle'}"></i>
-    <span>${message}</span>
-  `;
+  const icon = document.createElement('i');
+  icon.className = `fas fa-${type === 'success' ? 'check-circle' : type === 'error' ? 'exclamation-circle' : 'info-circle'}`;
+  const text = document.createElement('span');
+  text.textContent = String(message ?? '');
+  toast.append(icon, text);
   container.appendChild(toast);
   
   setTimeout(() => {
@@ -132,8 +120,10 @@ function hideLoading() {
 
 function updateConnectionStatus(connected) {
   const status = document.getElementById('connectionStatus');
+  if (!status) return;
   const icon = status.querySelector('i');
   const text = status.querySelector('span');
+  if (!icon || !text) return;
   
   if (connected) {
     icon.style.color = 'var(--success-green)';
@@ -147,8 +137,16 @@ function updateConnectionStatus(connected) {
 
 // ===== GOOGLE SIGN-IN =====
 function initGoogleSignIn() {
+  if (!GOOGLE_CLIENT_ID) {
+    showToast('Google sign-in is not configured for this deployment.', 'error');
+    return;
+  }
   if (!window.google?.accounts?.id) {
     console.warn('Google Identity SDK not loaded');
+    if (googleInitAttempts < 10) {
+      googleInitAttempts += 1;
+      setTimeout(initGoogleSignIn, 500);
+    }
     return;
   }
   
@@ -169,32 +167,50 @@ function initGoogleSignIn() {
 }
 
 function handleCredentialResponse(response) {
-  try {
-    const payload = parseJwt(response.credential);
-    googleUser = {
-      email: payload.email,
-      name: payload.name || payload.email.split('@')[0],
-      picture: payload.picture
-    };
-    
-    console.log('Google signed in:', googleUser);
-    
-    document.getElementById('authStatus').classList.add('hidden');
-    document.getElementById('gSignInDiv').style.display = 'none';
-    
-    const afterAuth = document.getElementById('afterAuth');
-    afterAuth.classList.remove('hidden');
-    
-    const avatar = document.getElementById('userAvatar');
-    avatar.textContent = googleUser.name.charAt(0).toUpperCase();
-    document.getElementById('userName').textContent = googleUser.name;
-    document.getElementById('userEmail').textContent = googleUser.email;
-    
-    showToast('Signed in successfully!', 'success');
-  } catch (err) {
-    console.error('Failed to parse Google credential', err);
+  if (!response?.credential) {
     showToast('Sign in failed. Please try again.', 'error');
+    return;
   }
+
+  googleCredential = response.credential;
+  googleUser = null;
+  const authStatus = document.getElementById('authStatus');
+  if (authStatus) {
+    authStatus.textContent = 'Verifying your Google account…';
+    authStatus.classList.remove('hidden');
+  }
+  const signIn = document.getElementById('gSignInDiv');
+  if (signIn) signIn.style.display = 'none';
+  if (ws?.readyState === WebSocket.OPEN) authenticateSocket();
+}
+
+function renderAuthenticatedUser(user) {
+  if (!user || typeof user.name !== 'string' || typeof user.email !== 'string') return;
+  googleUser = {
+    name: user.name.slice(0, 80),
+    email: user.email.slice(0, 320),
+    picture: typeof user.picture === 'string' ? user.picture : null
+  };
+  document.getElementById('authStatus')?.classList.add('hidden');
+  const afterAuth = document.getElementById('afterAuth');
+  afterAuth?.classList.remove('hidden');
+  const signIn = document.getElementById('gSignInDiv');
+  if (signIn) signIn.style.display = 'none';
+  const avatar = document.getElementById('userAvatar');
+  if (avatar) {
+    avatar.textContent = googleUser.name.charAt(0).toUpperCase();
+    if (googleUser.picture) {
+      avatar.style.backgroundImage = `url("${CSS.escape(googleUser.picture)}")`;
+      avatar.classList.add('image-avatar');
+    }
+  }
+  document.getElementById('userName')?.replaceChildren(document.createTextNode(googleUser.name));
+  document.getElementById('userEmail')?.replaceChildren(document.createTextNode(googleUser.email));
+}
+
+function authenticateSocket() {
+  if (!googleCredential || !ws || ws.readyState !== WebSocket.OPEN) return;
+  sendSignalingMessage({ type: 'authenticate', credential: googleCredential });
 }
 
 function signOut() {
@@ -202,12 +218,18 @@ function signOut() {
     if (!confirm('You are in a meeting. Are you sure you want to sign out?')) {
       return;
     }
-    leaveMeeting();
+    leaveMeeting(true);
   }
-  
+
+  googleCredential = null;
+  sessionToken = null;
   googleUser = null;
+  isAdmin = false;
+  adminToken = null;
+  window.google?.accounts?.id?.disableAutoSelect?.();
   document.getElementById('afterAuth').classList.add('hidden');
   document.getElementById('authStatus').classList.remove('hidden');
+  document.getElementById('authStatus').textContent = 'Sign in to continue';
   document.getElementById('gSignInDiv').style.display = 'block';
   
   showToast('Signed out successfully', 'info');
@@ -215,62 +237,47 @@ function signOut() {
 
 // ===== ICE SERVER CONFIGURATION =====
 async function loadIceServers() {
-  // NEW: This function will now try the primary server, and
-  // fall back to the secondary if the primary fails.
-  let iceUrl = SERVER_ENDPOINTS[currentServerIndex].ice;
-  let response;
+  if (SERVER_ENDPOINTS.length === 0) {
+    pcConfig.iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
+    return;
+  }
 
-  try {
-    console.log(`🔧 Loading ICE config from primary: ${iceUrl}`);
-    response = await fetch(iceUrl);
-    if (!response.ok) throw new Error('Primary ICE server failed');
-  } catch (err) {
-    console.warn(`⚠️ Primary ICE server failed. Trying backup...`);
-    // Fallback to the *other* server
-    const fallbackIndex = (currentServerIndex + 1) % SERVER_ENDPOINTS.length;
-    iceUrl = SERVER_ENDPOINTS[fallbackIndex].ice;
-    
+  for (let offset = 0; offset < SERVER_ENDPOINTS.length; offset += 1) {
+    const index = (currentServerIndex + offset) % SERVER_ENDPOINTS.length;
     try {
-      console.log(`🔧 Loading ICE config from backup: ${iceUrl}`);
-      response = await fetch(iceUrl);
-    } catch (fallbackErr) {
-      // If both fail, use a public STUN server as a last resort
-      console.error('❌ Failed to fetch ICE servers from all sources:', fallbackErr);
-      pcConfig.iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
-      return; // Exit the function
+      const response = await fetch(SERVER_ENDPOINTS[index].ice, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`ICE endpoint returned ${response.status}`);
+      const data = await response.json();
+      if (!Array.isArray(data.iceServers) || data.iceServers.length === 0) throw new Error('No ICE servers returned');
+      currentServerIndex = index;
+      pcConfig.iceServers = data.iceServers;
+      pcConfig.iceTransportPolicy = data.iceTransportPolicy || 'all';
+      pcConfig.iceCandidatePoolSize = data.iceCandidatePoolSize || 10;
+      return;
+    } catch (error) {
+      console.warn(`ICE endpoint ${SERVER_ENDPOINTS[index].name} unavailable:`, error.message);
     }
   }
 
-  // If either fetch succeeded, process the response
-  try {
-    const data = await response.json();
-    pcConfig.iceServers = data.iceServers || [];
-    pcConfig.iceTransportPolicy = data.iceTransportPolicy || 'all';
-    pcConfig.iceCandidatePoolSize = data.iceCandidatePoolSize || 10;
-    
-    console.log('✅ ICE servers loaded:', pcConfig.iceServers.length, 'servers');
-  } catch (jsonErr) {
-    console.error('❌ Failed to parse ICE server JSON:', jsonErr);
-    pcConfig.iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
-  }
+  pcConfig.iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
 }
 
 // ===== WEBSOCKET CONNECTION =====
 function initWebSocket() {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    console.log('WebSocket already connected');
+  if (ws && [WebSocket.CONNECTING, WebSocket.OPEN].includes(ws.readyState)) return;
+  if (SERVER_ENDPOINTS.length === 0) {
+    showToast('No meeting server is configured.', 'error');
     return;
   }
-  
-  // NEW: Get the WebSocket URL from our endpoints array
+
   const currentEndpoint = SERVER_ENDPOINTS[currentServerIndex];
-  console.log(`🔌 Attempting to connect to: ${currentEndpoint.name} (${currentEndpoint.ws})`);
+  intentionalSocketClose = false;
   ws = new WebSocket(currentEndpoint.ws);
   
   ws.onopen = () => {
-    console.log(`✅ WebSocket connected to ${currentEndpoint.name}`);
     updateConnectionStatus(true);
-    reconnectAttempts = 0; // Reset attempts on a successful connection
+    reconnectAttempts = 0;
+    authenticateSocket();
   };
   
   ws.onmessage = async (evt) => {
@@ -283,46 +290,24 @@ function initWebSocket() {
   };
   
   ws.onerror = (err) => {
-    console.error(`❌ WebSocket error on ${currentEndpoint.name}:`, err);
     updateConnectionStatus(false);
-    // Don't try to failover here, onclose will handle it
   };
   
   ws.onclose = () => {
-    console.log(`⚠️ WebSocket closed from ${currentEndpoint.name}`);
+    ws = null;
     updateConnectionStatus(false);
-    
-    // NEW: Failover and Reconnect Logic
-    if (isInMeeting) {
-      // If we are in a meeting, try to reconnect to the *same* server first.
-      if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-        reconnectAttempts++;
-        showToast(`Reconnecting to ${currentEndpoint.name}... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`, 'info');
-        setTimeout(initWebSocket, 2000 * reconnectAttempts);
-      } 
-      // If reconnects fail, try the *next* server.
-      else if (currentServerIndex + 1 < SERVER_ENDPOINTS.length) {
-        currentServerIndex++; // Move to the next server in the array
-        reconnectAttempts = 0; // Reset attempts for the new server
-        showToast(`Connection to ${currentEndpoint.name} failed. Trying backup server...`, 'error');
-        initWebSocket(); // This will now use the new `currentServerIndex`
-      } 
-      // If all servers have failed, stop trying.
-      else {
-        showToast('All servers are unresponsive. Please refresh to try again.', 'error');
-      }
-    } 
-    // If not in a meeting (i.e., initial connection failed)
-    else if (currentServerIndex + 1 < SERVER_ENDPOINTS.length) {
-      currentServerIndex++;
+    if (intentionalSocketClose) return;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectAttempts += 1;
+    // Live rooms are in one server's memory. Never move an active meeting to
+    // another backend unless a shared signaling store is introduced.
+    if (!isInMeeting && reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+      currentServerIndex = (currentServerIndex + 1) % SERVER_ENDPOINTS.length;
       reconnectAttempts = 0;
-      showToast(`Primary server is down. Trying backup server...`, 'info');
-      initWebSocket();
+      showToast(`Trying ${SERVER_ENDPOINTS[currentServerIndex].name}…`, 'info');
     }
-    // If all servers fail on initial load
-    else {
-      showToast('All servers are unavailable. Please try again later.', 'error');
-    }
+    const delay = Math.min(15_000, 1_000 * Math.max(1, reconnectAttempts));
+    reconnectTimer = setTimeout(initWebSocket, delay);
   };
 }
 
@@ -331,10 +316,29 @@ async function handleSignalingMessage(data) {
   console.log('📩 Received:', data.type);
   
   switch (data.type) {
+    case 'authenticated':
+      sessionToken = data.sessionToken || null;
+      renderAuthenticatedUser(data.user);
+      showToast('Signed in successfully!', 'success');
+      if (isInMeeting && roomId && resumeToken) {
+        sendSignalingMessage({ type: 'resume_room', roomId, resumeToken });
+      }
+      break;
+
     case 'your_info':
-      clientId = data.clientId;
-      isAdmin = !!data.isAdmin;
-      adminToken = data.adminToken || adminToken;
+      if (data.clientId) {
+        const previousClientId = clientId;
+        clientId = data.clientId;
+        if (previousClientId !== clientId) syncLocalVideoIdentity(previousClientId, clientId);
+      }
+      if (data.user) renderAuthenticatedUser(data.user);
+      if (data.roomId) {
+        isAdmin = !!data.isAdmin;
+        adminToken = data.adminToken || adminToken;
+      } else if (!isInMeeting) {
+        isAdmin = false;
+        adminToken = null;
+      }
       
       if (data.roomId) {
         roomId = data.roomId;
@@ -346,36 +350,100 @@ async function handleSignalingMessage(data) {
       
     case 'room_created':
       roomId = data.roomId;
+      resumeToken = data.resumeToken || resumeToken;
       updateRoomDisplay();
       showToast(`Room created: ${roomId}`, 'success');
+      roomActionPending = null;
+      showMeetingRoom();
+      hideLoading();
+      break;
+
+    case 'room_joined':
+    case 'room_resumed':
+      roomId = data.roomId || roomId;
+      resumeToken = data.resumeToken || resumeToken;
+      updateRoomDisplay();
+      roomActionPending = null;
+      showMeetingRoom();
+      hideLoading();
+      if (data.type === 'room_resumed') showToast('Meeting connection restored', 'success');
       break;
       
     case 'room_state':
-      console.log('📋 Room state received:', data.participants.length, 'participants');
-      for (const p of data.participants) {
+      participantsState.clear();
+      for (const p of Array.isArray(data.participants) ? data.participants : []) {
         if (p.clientId !== clientId) {
           participantsState.set(p.clientId, {
             username: p.username,
-            isMuted: p.isMuted,
-            isAdminMuted: p.isAdminMuted,
-            handRaised: p.handRaised
+            picture: p.picture,
+            isMuted: !!p.isMuted,
+            isAdminMuted: !!p.isAdminMuted,
+            handRaised: !!p.handRaised,
+            isCameraOff: !!p.isCameraOff
           });
           addParticipantToList(p.clientId, p.username, p.handRaised, p.isAdminMuted);
-          await createOffer(p.clientId, p.username);
+          updateParticipantCameraStatus(p.clientId, p.isCameraOff, p.username);
+          if (p.connected !== false) await createOffer(p.clientId, p.username);
         }
       }
+      updateParticipantsList();
       break;
       
     case 'peer_joined':
       showToast(`${data.username} joined`, 'info');
       participantsState.set(data.clientId, {
         username: data.username,
-        isMuted: false,
-        isAdminMuted: false,
-        handRaised: false
+        picture: data.picture,
+        isMuted: !!data.isMuted,
+        isAdminMuted: !!data.isAdminMuted,
+        handRaised: !!data.handRaised,
+        isCameraOff: !!data.isCameraOff
       });
-      addParticipantToList(data.clientId, data.username, false, false);
+      addParticipantToList(data.clientId, data.username, !!data.handRaised, !!data.isAdminMuted);
+      updateParticipantCameraStatus(data.clientId, data.isCameraOff, data.username);
       break;
+
+    case 'peer_reconnected':
+      participantsState.set(data.clientId, {
+        username: data.username,
+        picture: data.picture,
+        isMuted: !!data.isMuted,
+        isAdminMuted: !!data.isAdminMuted,
+        handRaised: !!data.handRaised,
+        isCameraOff: !!data.isCameraOff
+      });
+      addParticipantToList(data.clientId, data.username, !!data.handRaised, !!data.isAdminMuted);
+      updateParticipantCameraStatus(data.clientId, data.isCameraOff, data.username);
+      break;
+
+    case 'peer_disconnected':
+      removePeer(data.clientId);
+      participantsState.delete(data.clientId);
+      break;
+
+    case 'media_state': {
+      if (data.clientId === clientId) {
+        isMuted = !!data.isMuted;
+        isCameraOff = !!data.isCameraOff;
+        handRaised = !!data.handRaised;
+        updateMicButton();
+        updateCameraButton();
+        updateRaiseHandButton();
+        updateParticipantMuteStatus(clientId, isMuted);
+        updateParticipantCameraStatus(clientId, isCameraOff, googleUser?.name);
+      } else {
+        const participant = participantsState.get(data.clientId);
+        if (participant) {
+          participant.isMuted = !!data.isMuted;
+          participant.isAdminMuted = !!data.isAdminMuted;
+          participant.handRaised = !!data.handRaised;
+          participant.isCameraOff = !!data.isCameraOff;
+          updateParticipantMuteStatus(data.clientId, participant.isAdminMuted || participant.isMuted);
+          updateParticipantHandStatus(data.clientId, participant.handRaised);
+        }
+      }
+      break;
+    }
       
     case 'offer':
       await handleOffer(data.from || data.fromId, data.fromUsername, data.sdp);
@@ -392,24 +460,17 @@ async function handleSignalingMessage(data) {
     case 'force_mute':
       if (data.targetClientId === clientId) {
         isAdminMuted = !!data.isAdminMuted;
-        if (data.muteState) {
-          isMuted = true;
-          if (localStream) {
-            localStream.getAudioTracks().forEach(t => t.enabled = false);
-          }
-          updateMicButton();
-          if (isAdminMuted) {
-            showToast('You were muted by the host. Request to unmute if needed.', 'info');
-          }
-        } else {
-          isAdminMuted = false;
-          showToast('Host allowed you to unmute', 'success');
-        }
+        isMuted = !!data.muteState;
+        if (localStream) localStream.getAudioTracks().forEach(t => { t.enabled = !isMuted; });
+        updateMicButton();
+        updateParticipantMuteStatus(clientId, isMuted);
+        showToast(isMuted ? 'You were muted by the host. Request to unmute if needed.' : 'Host allowed you to unmute', isMuted ? 'info' : 'success');
       } else {
         const pState = participantsState.get(data.targetClientId);
         if (pState) {
+          pState.isMuted = !!data.muteState;
           pState.isAdminMuted = !!data.isAdminMuted;
-          updateParticipantMuteStatus(data.targetClientId, data.isAdminMuted);
+          updateParticipantMuteStatus(data.targetClientId, pState.isAdminMuted || pState.isMuted);
         }
       }
       break;
@@ -429,6 +490,8 @@ async function handleSignalingMessage(data) {
       break;
       
     case 'all_hands_lowered':
+      handRaised = false;
+      updateRaiseHandButton();
       participantsState.forEach((state, id) => {
         state.handRaised = false;
         updateParticipantHandStatus(id, false);
@@ -485,11 +548,32 @@ async function handleSignalingMessage(data) {
       
     case 'meeting_ended':
       showToast('Meeting ended by host', 'info');
-      leaveMeeting();
+      leaveMeeting(true);
+      break;
+
+    case 'room_left':
+      roomId = null;
+      resumeToken = null;
+      break;
+
+    case 'disconnected':
+      updateConnectionStatus(false);
       break;
       
     case 'error':
       console.error('Server error:', data.message);
+      if (data.code === 'AUTH_FAILED' || data.code === 'AUTH_REQUIRED') {
+        googleCredential = null;
+        sessionToken = null;
+        googleUser = null;
+        document.getElementById('gSignInDiv')?.style.setProperty('display', 'flex');
+        const authStatus = document.getElementById('authStatus');
+        if (authStatus) {
+          authStatus.textContent = 'Sign in to continue';
+          authStatus.classList.remove('hidden');
+        }
+      }
+      roomActionPending = null;
       showToast(data.message, 'error');
       hideLoading();
       break;
@@ -508,9 +592,11 @@ async function translateText(text, sourceLang, targetLang, callback) {
   // *** MODIFICATION: API Key Removed ***
   // The API key is no longer here. We call our own backend.
   
-  // Get the base URL (e.g., "https://just-holly-kanhaiya1610-b072918c.koyeb.app")
-  const baseUrl = SERVER_ENDPOINTS[currentServerIndex].ice.replace('/ice', '');
-  const apiUrl = `${baseUrl}/translate`;
+  const apiUrl = SERVER_ENDPOINTS[currentServerIndex]?.translate;
+  if (!apiUrl || !sessionToken) {
+    callback(text);
+    return;
+  }
 
   try {
     // Use exponential backoff for retries
@@ -519,8 +605,10 @@ async function translateText(text, sourceLang, targetLang, callback) {
     for (let i = 0; i < 3; i++) { // Retry up to 3 times
       response = await fetch(apiUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        // *** MODIFICATION: Send raw text data, not a Gemini payload ***
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`
+        },
         body: JSON.stringify({
           text,
           sourceLang,
@@ -553,7 +641,7 @@ async function translateText(text, sourceLang, targetLang, callback) {
     }
   } catch (error) {
     console.error('Translation failed:', error);
-    callback(`${text} (Translation failed)`); // Fallback to original text
+    callback(text);
   }
 }
 
@@ -563,8 +651,8 @@ async function translateText(text, sourceLang, targetLang, callback) {
  */
 function renderCaption(username, text, isFinal) {
   const container = document.getElementById('captionsDisplay');
-  // Use a consistent ID for the speaker
-  const captionId = `caption-${username.replace(/\s+/g, '-')}`;
+  if (!container) return;
+  const captionId = `caption-${Array.from(String(username)).map(char => char.codePointAt(0).toString(16)).join('-')}`;
   let captionElement = document.getElementById(captionId);
 
   // Create new element if one for this speaker doesn't exist
@@ -579,7 +667,7 @@ function renderCaption(username, text, isFinal) {
 
   // Update the content
   captionElement.innerHTML = `
-    <span class="caption-speaker ${isOwnCaption ? 'own' : ''}">${username}:</span>
+    <span class="caption-speaker ${isOwnCaption ? 'own' : ''}">${escapeHtml(username)}:</span>
     <span class="caption-text ${isFinal ? 'final' : 'interim'}">${escapeHtml(text)}</span>
   `;
 
@@ -629,8 +717,8 @@ function displayCaption(username, text, isFinal, sourceLanguage = 'en-US') {
 
   if (isFinal) {
     // Final text: Clear any pending interim translations and translate this.
-    clearTimeout(translationTimeout);
-    translationTimeout = null;
+    clearTimeout(translationTimeouts.get(username));
+    translationTimeouts.delete(username);
     translationCache.delete(username); // Clear cache for this user
 
     // Show a placeholder with the *original* text while translating
@@ -645,14 +733,12 @@ function displayCaption(username, text, isFinal, sourceLanguage = 'en-US') {
     // This prevents hammering the API for every single interim word.
     translationCache.set(username, text);
 
-    if (translationTimeout) {
-      clearTimeout(translationTimeout);
-    }
+    clearTimeout(translationTimeouts.get(username));
 
     // Show interim in original language (faded)
     renderCaption(username, text, false);
 
-    translationTimeout = setTimeout(() => {
+    const timeout = setTimeout(() => {
       const cachedText = translationCache.get(username);
       if (cachedText) {
         translateText(cachedText, sourceLanguage, myPreferredLanguage, (translatedText) => {
@@ -661,7 +747,9 @@ function displayCaption(username, text, isFinal, sourceLanguage = 'en-US') {
         });
         translationCache.delete(username);
       }
+      translationTimeouts.delete(username);
     }, 1000); // Wait 1 second after last interim result before translating
+    translationTimeouts.set(username, timeout);
   }
 }
 
@@ -797,6 +885,9 @@ function stopCaptions() {
   }
   
   captionsEnabled = false;
+  translationTimeouts.forEach(timeout => clearTimeout(timeout));
+  translationTimeouts.clear();
+  translationCache.clear();
   updateCaptionsButton();
   
   // Clear caption display
@@ -973,22 +1064,11 @@ async function createRoom() {
   }
   
   showLoading('Creating room...');
-  
+
   try {
     await setupLocalStream();
-    
-    ws.send(JSON.stringify({
-      type: 'create_room',
-      username: googleUser.name,
-      identity: { email: googleUser.email }
-    }));
-    
-    setTimeout(() => {
-      if (roomId) {
-        showMeetingRoom();
-        hideLoading();
-      }
-    }, 1000);
+    roomActionPending = 'create';
+    sendSignalingMessage({ type: 'create_room' });
   } catch (err) {
     console.error('Failed to create room:', err);
     showToast('Failed to create room', 'error');
@@ -1019,20 +1099,8 @@ async function joinRoomPrompt() {
   
   try {
     await setupLocalStream();
-    
-    ws.send(JSON.stringify({
-      type: 'join_room',
-      roomId: id,
-      username: googleUser.name,
-      identity: { email: googleUser.email }
-    }));
-    
-    setTimeout(() => {
-      if (roomId) {
-        showMeetingRoom();
-        hideLoading();
-      }
-    }, 1000);
+    roomActionPending = 'join';
+    sendSignalingMessage({ type: 'join_room', roomId: id });
   } catch (err) {
     console.error('Failed to join room:', err);
     showToast('Failed to join room', 'error');
@@ -1043,7 +1111,7 @@ async function joinRoomPrompt() {
 function updateRoomDisplay() {
   const display = document.getElementById('roomDisplay');
   if (display) {
-    display.innerHTML = `<i class="fas fa-video"></i> Room: ${roomId}`;
+    display.textContent = roomId ? `Room: ${roomId}` : 'Room: Not connected';
   }
 }
 
@@ -1071,9 +1139,14 @@ async function setupLocalStream() {
     return;
   }
   
+  if (!navigator.mediaDevices?.getUserMedia) {
+    showToast('Camera and microphone access are not supported in this browser.', 'error');
+    throw new Error('getUserMedia is unavailable');
+  }
+
   try {
     console.log('🎥 Requesting camera and microphone access...');
-    localStream = await navigator.mediaDevices.getUserMedia({
+    const fullConstraints = {
       video: {
         width: { ideal: 1280, max: 1920 },
         height: { ideal: 720, max: 1080 },
@@ -1086,10 +1159,35 @@ async function setupLocalStream() {
         autoGainControl: true,
         sampleRate: 48000
       }
-    });
+    };
+
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia(fullConstraints);
+    } catch (fullError) {
+      console.warn('Combined camera/microphone permission failed:', fullError.name);
+      const fallbackConstraints = [
+        { video: fullConstraints.video, audio: false },
+        { video: false, audio: fullConstraints.audio }
+      ];
+      for (const constraints of fallbackConstraints) {
+        try {
+          localStream = await navigator.mediaDevices.getUserMedia(constraints);
+          break;
+        } catch (fallbackError) {
+          console.warn('Media fallback failed:', fallbackError.name);
+        }
+      }
+      if (!localStream) throw fullError;
+      showToast('Joined with limited media access. You can retry your camera or microphone later.', 'info');
+    }
     
     console.log('✅ Local stream obtained');
-    addVideoElement(clientId, localStream, true, googleUser.name);
+    isCameraOff = localStream.getVideoTracks().length === 0;
+    isMuted = localStream.getAudioTracks().length === 0;
+    addVideoElement(clientId || 'local', localStream, true, googleUser.name);
+    updateMicButton();
+    updateCameraButton();
+    updateParticipantCameraStatus(clientId || 'local', isCameraOff, googleUser.name);
   } catch (err) {
     console.error('❌ getUserMedia failed:', err);
     showToast('Could not access camera/microphone', 'error');
@@ -1208,6 +1306,10 @@ async function toggleRecording() {
 async function startRecording() {
   try {
     console.log('🔴 Starting recording...');
+    if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) {
+      showToast('Recording is not supported in this browser.', 'error');
+      return;
+    }
     
     const canvas = document.createElement('canvas');
     canvas.width = 1920;
@@ -1218,19 +1320,23 @@ async function startRecording() {
     
     let audioContext;
     let destination;
-    
-    if (localStream && localStream.getAudioTracks().length > 0) {
-      audioContext = new AudioContext();
-      destination = audioContext.createMediaStreamDestination();
-      
-      const localAudioSource = audioContext.createMediaStreamSource(
-        new MediaStream(localStream.getAudioTracks())
-      );
-      localAudioSource.connect(destination);
-      
-      destination.stream.getAudioTracks().forEach(track => {
-        canvasStream.addTrack(track);
-      });
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (AudioContextClass) {
+      const audioStreams = Array.from(document.querySelectorAll('#videoGrid video'))
+        .map(videoElement => videoElement.srcObject)
+        .filter(stream => stream?.getAudioTracks?.().length > 0);
+      if (audioStreams.length > 0) {
+        audioContext = new AudioContextClass();
+        destination = audioContext.createMediaStreamDestination();
+        audioStreams.forEach(stream => {
+          try {
+            audioContext.createMediaStreamSource(stream).connect(destination);
+          } catch (error) {
+            console.warn('Could not mix one participant audio stream:', error.message);
+          }
+        });
+        destination.stream.getAudioTracks().forEach(track => canvasStream.addTrack(track));
+      }
     }
     
     const captureFrame = () => {
@@ -1242,8 +1348,8 @@ async function startRecording() {
       const videoGrid = document.getElementById('videoGrid');
       const videos = videoGrid.querySelectorAll('video');
       
-      const cols = Math.ceil(Math.sqrt(videos.length));
-      const rows = Math.ceil(videos.length / cols);
+      const cols = Math.max(1, Math.ceil(Math.sqrt(videos.length)));
+      const rows = Math.max(1, Math.ceil(videos.length / cols));
       const videoWidth = canvas.width / cols;
       const videoHeight = canvas.height / rows;
       
@@ -1258,10 +1364,8 @@ async function startRecording() {
         }
       });
       
-      requestAnimationFrame(captureFrame);
+      recordingFrameId = requestAnimationFrame(captureFrame);
     };
-    
-    captureFrame();
     
     const options = {
       mimeType: 'video/webm;codecs=vp9,opus',
@@ -1282,6 +1386,8 @@ async function startRecording() {
     };
     
     mediaRecorder.onstop = () => {
+      if (recordingFrameId) cancelAnimationFrame(recordingFrameId);
+      recordingFrameId = null;
       const blob = new Blob(recordedChunks, { type: 'video/webm' });
       const url = URL.createObjectURL(blob);
       
@@ -1304,8 +1410,9 @@ async function startRecording() {
       }
     };
     
-    mediaRecorder.start(1000);
     isRecording = true;
+    mediaRecorder.start(1000);
+    captureFrame();
     updateRecordingButton();
     showToast('Recording started', 'success');
     
@@ -1316,7 +1423,10 @@ async function startRecording() {
 }
 
 function stopRecording() {
-  if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
+  if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+    isRecording = false;
+    return;
+  }
   
   console.log('⏹️ Stopping recording...');
   mediaRecorder.stop();
@@ -1344,11 +1454,13 @@ function updateRecordingButton() {
 
 // ===== VIDEO ELEMENT MANAGEMENT =====
 function addVideoElement(id, stream, isLocal = false, username = 'Participant') {
+  const elementId = id || 'local';
   let wrapper = document.getElementById(`video-${id}`);
+  if (!wrapper) wrapper = document.getElementById(`video-${elementId}`);
   
   if (!wrapper) {
     wrapper = document.createElement('div');
-    wrapper.id = `video-${id}`;
+    wrapper.id = `video-${elementId}`;
     wrapper.className = `video-wrapper ${isLocal ? 'local' : ''}`;
     
     const video = document.createElement('video');
@@ -1359,31 +1471,61 @@ function addVideoElement(id, stream, isLocal = false, username = 'Participant') 
     
     const overlay = document.createElement('div');
     overlay.className = 'video-overlay';
+    const cameraOffState = document.createElement('div');
+    cameraOffState.id = `camera-off-${elementId}`;
+    cameraOffState.className = 'video-off-state hidden';
+    cameraOffState.innerHTML = `
+      <div class="video-off-avatar">${escapeHtml((isLocal ? 'You' : username).charAt(0).toUpperCase())}</div>
+      <span>Camera off</span>
+    `;
+
     overlay.innerHTML = `
-      <div class="participant-name">${isLocal ? 'You' : username}</div>
+      <div class="participant-name">${isLocal ? 'You' : escapeHtml(username)}</div>
       <div class="video-indicators">
-        <div class="indicator muted hidden" id="muted-${id}">
+        <div class="indicator muted hidden" id="muted-${elementId}">
           <i class="fas fa-microphone-slash"></i>
         </div>
-        <div class="indicator hand-raised hidden" id="hand-${id}">
+        <div class="indicator hand-raised hidden" id="hand-${elementId}">
           <i class="fas fa-hand-paper"></i>
         </div>
       </div>
     `;
     
     wrapper.appendChild(video);
+    wrapper.appendChild(cameraOffState);
     wrapper.appendChild(overlay);
     
     document.getElementById('videoGrid').appendChild(wrapper);
+    updateParticipantCameraStatus(elementId, isLocal ? isCameraOff : participantsState.get(elementId)?.isCameraOff, username);
     
     console.log(`✅ Added video element for ${id} (${username})`);
   } else {
     const video = wrapper.querySelector('video');
     video.srcObject = stream;
+    updateParticipantCameraStatus(elementId, isLocal ? isCameraOff : participantsState.get(elementId)?.isCameraOff, username);
     console.log(`🔄 Updated video stream for ${id}`);
   }
   
   updateVideoGrid();
+}
+
+function updateParticipantCameraStatus(participantId, isOff, username = 'Participant') {
+  const elementId = participantId || 'local';
+  const indicator = document.getElementById(`camera-off-${elementId}`);
+  if (!indicator) return;
+  const avatar = indicator.querySelector('.video-off-avatar');
+  if (avatar) avatar.textContent = String(username || 'Participant').charAt(0).toUpperCase();
+  indicator.classList.toggle('hidden', !isOff);
+}
+
+function syncLocalVideoIdentity(previousId, nextId) {
+  const oldId = previousId || 'local';
+  const previousWrapper = document.getElementById(`video-${oldId}`);
+  if (!previousWrapper || !nextId) return;
+  previousWrapper.id = `video-${nextId}`;
+  previousWrapper.querySelectorAll('[id]').forEach(element => {
+    if (element.id.endsWith(`-${oldId}`)) element.id = element.id.replace(`-${oldId}`, `-${nextId}`);
+  });
 }
 
 function updateVideoGrid() {
@@ -1585,14 +1727,17 @@ function toggleMic() {
   localStream.getAudioTracks().forEach(track => {
     track.enabled = !isMuted;
   });
-  
+
+  sendSignalingMessage({ type: 'media_state', isMuted, isCameraOff, handRaised });
   updateMicButton();
+  updateParticipantMuteStatus(clientId, isMuted);
   showToast(isMuted ? 'Microphone muted' : 'Microphone unmuted', 'info');
 }
 
 function updateMicButton() {
   const btn = document.getElementById('toggleMicBtn');
   const icon = document.getElementById('micIcon');
+  if (!btn || !icon) return;
   
   if (isMuted) {
     icon.className = 'fas fa-microphone-slash';
@@ -1615,14 +1760,17 @@ function toggleCamera() {
   localStream.getVideoTracks().forEach(track => {
     track.enabled = !isCameraOff;
   });
-  
+
+  sendSignalingMessage({ type: 'media_state', isMuted, isCameraOff, handRaised });
   updateCameraButton();
+  updateParticipantCameraStatus(clientId, isCameraOff, googleUser?.name);
   showToast(isCameraOff ? 'Camera off' : 'Camera on', 'info');
 }
 
 function updateCameraButton() {
   const btn = document.getElementById('toggleCamBtn');
   const icon = document.getElementById('camIcon');
+  if (!btn || !icon) return;
   
   if (isCameraOff) {
     icon.className = 'fas fa-video-slash';
@@ -1637,6 +1785,7 @@ function updateCameraButton() {
 function toggleRaiseHand() {
   handRaised = !handRaised;
   sendSignalingMessage({ type: 'raise_hand', handRaised });
+  sendSignalingMessage({ type: 'media_state', isMuted, isCameraOff, handRaised });
   updateRaiseHandButton();
   updateParticipantHandStatus(clientId, handRaised);
   showToast(handRaised ? '✋ Hand raised' : 'Hand lowered', 'info');
@@ -1695,13 +1844,18 @@ function showUnmuteRequestModal(fromId, fromUsername) {
   modal.innerHTML = `
     <div class="modal-content">
       <h3>Unmute Request</h3>
-      <p><strong>${fromUsername}</strong> is requesting permission to unmute.</p>
+      <p><strong>${escapeHtml(fromUsername)}</strong> is requesting permission to unmute.</p>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="closeModal(this)">Deny</button>
-        <button class="btn-primary" onclick="approveUnmute('${fromId}'); closeModal(this);">Approve</button>
+        <button class="btn-secondary modal-deny">Deny</button>
+        <button class="btn-primary modal-approve">Approve</button>
       </div>
     </div>
   `;
+  modal.querySelector('.modal-deny').addEventListener('click', () => modal.remove());
+  modal.querySelector('.modal-approve').addEventListener('click', () => {
+    approveUnmute(fromId);
+    modal.remove();
+  });
   document.body.appendChild(modal);
 }
 
@@ -1723,6 +1877,8 @@ function closeModal(btn) {
 // Participant management functions
 function addParticipantToList(id, username, handRaised = false, isAdminMuted = false) {
   const list = document.getElementById('participantsList');
+  if (!list || !id) return;
+  username = String(username || 'Participant').slice(0, 80);
   let item = document.getElementById(`participant-${id}`);
   if (!item) {
     item = document.createElement('div');
@@ -1731,9 +1887,9 @@ function addParticipantToList(id, username, handRaised = false, isAdminMuted = f
     const initial = username.charAt(0).toUpperCase();
     item.innerHTML = `
       <div class="participant-info">
-        <div class="participant-avatar">${initial}</div>
+        <div class="participant-avatar">${escapeHtml(initial)}</div>
         <div class="participant-details">
-          <p>${username}</p>
+          <p>${escapeHtml(username)}</p>
           <span>${id === clientId ? 'You' : 'Participant'}</span>
         </div>
         <div class="participant-status">
@@ -1744,15 +1900,17 @@ function addParticipantToList(id, username, handRaised = false, isAdminMuted = f
       </div>
       ${isAdmin && id !== clientId ? `
         <div class="participant-controls">
-          <button class="btn-icon ${isAdminMuted ? 'muted' : ''}" onclick="toggleParticipantMute('${id}')" title="${isAdminMuted ? 'Unmute' : 'Mute'}">
+          <button class="btn-icon participant-mute-button ${isAdminMuted ? 'muted' : ''}" title="${isAdminMuted ? 'Unmute' : 'Mute'}" aria-label="${isAdminMuted ? 'Unmute' : 'Mute'} ${escapeHtml(username)}">
             <i class="fas fa-microphone${isAdminMuted ? '-slash' : ''}"></i>
           </button>
-          <button class="btn-icon" onclick="showTransferAdminModal('${id}', '${username}')" title="Transfer Admin">
+          <button class="btn-icon participant-transfer-button" title="Transfer Admin" aria-label="Transfer host to ${escapeHtml(username)}">
             <i class="fas fa-crown"></i>
           </button>
         </div>
       ` : ''}
     `;
+    item.querySelector('.participant-mute-button')?.addEventListener('click', () => toggleParticipantMute(id));
+    item.querySelector('.participant-transfer-button')?.addEventListener('click', () => showTransferAdminModal(id, username));
     list.appendChild(item);
   }
   updateParticipantCount();
@@ -1768,13 +1926,16 @@ function removeParticipantFromList(id) {
 
 function updateParticipantCount() {
   const list = document.getElementById('participantsList');
+  if (!list) return;
   const count = list.children.length;
-  document.getElementById('participantCount').textContent = count;
-  document.getElementById('participantCountBadge').textContent = count;
+  document.getElementById('participantCount')?.replaceChildren(document.createTextNode(String(count)));
+  document.getElementById('participantCountBadge')?.replaceChildren(document.createTextNode(String(count)));
 }
 
 function updateParticipantMuteStatus(participantId, isAdminMuted) {
   const listItem = document.getElementById(`participant-${participantId}`);
+  const mutedIndicator = document.getElementById(`muted-${participantId}`);
+  mutedIndicator?.classList.toggle('hidden', !isAdminMuted);
   if (listItem && isAdmin) {
     const muteBtn = listItem.querySelector('.participant-controls button:first-child');
     if (muteBtn) {
@@ -1794,6 +1955,7 @@ function updateParticipantMuteStatus(participantId, isAdminMuted) {
 
 function updateParticipantsList() {
   const list = document.getElementById('participantsList');
+  if (!list) return;
   list.innerHTML = '';
   if (clientId && googleUser) {
     addParticipantToList(clientId, googleUser.name, handRaised, false);
@@ -1840,14 +2002,19 @@ function showTransferAdminModal(targetId, targetUsername) {
   modal.innerHTML = `
     <div class="modal-content">
       <h3>Transfer Host Privileges</h3>
-      <p>Transfer host to <strong>${targetUsername}</strong>?</p>
+      <p>Transfer host to <strong>${escapeHtml(targetUsername)}</strong>?</p>
       <p class="warning-text">You will no longer be the host.</p>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="closeModal(this)">Cancel</button>
-        <button class="btn-primary" onclick="transferAdmin('${targetId}'); closeModal(this);">Transfer</button>
+        <button class="btn-secondary modal-cancel">Cancel</button>
+        <button class="btn-primary modal-confirm">Transfer</button>
       </div>
     </div>
   `;
+  modal.querySelector('.modal-cancel').addEventListener('click', () => modal.remove());
+  modal.querySelector('.modal-confirm').addEventListener('click', () => {
+    transferAdmin(targetId);
+    modal.remove();
+  });
   document.body.appendChild(modal);
 }
 
@@ -1879,12 +2046,13 @@ function sendChatMessage() {
 
 function displayChatMessage(username, message, timestamp, isLocal) {
   const container = document.getElementById('chatMessages');
+  if (!container) return;
   const msgDiv = document.createElement('div');
   msgDiv.className = `chat-message ${isLocal ? 'local' : 'remote'}`;
   msgDiv.innerHTML = `
-    <div class="message-sender">${isLocal ? 'You' : username}</div>
+    <div class="message-sender">${isLocal ? 'You' : escapeHtml(username)}</div>
     <div class="message-bubble">${escapeHtml(message)}</div>
-    <div class="message-time">${timestamp || formatTime(new Date())}</div>
+    <div class="message-time">${escapeHtml(timestamp || formatTime(new Date()))}</div>
   `;
   container.appendChild(msgDiv);
   container.scrollTop = container.scrollHeight;
@@ -1983,9 +2151,13 @@ function removePeer(id) {
   removeParticipantFromList(id);
 }
 
-function leaveMeeting() {
-  if (!confirm('Leave the meeting?')) return;
+function leaveMeeting(force = false) {
+  if (!force && !confirm('Leave the meeting?')) return false;
   console.log('🚪 Leaving meeting...');
+
+  if (ws?.readyState === WebSocket.OPEN && roomId) {
+    sendSignalingMessage({ type: 'leave_room' });
+  }
   
   if (isRecording) stopRecording();
   if (isScreenSharing) stopScreenShare();
@@ -2022,6 +2194,7 @@ function leaveMeeting() {
   
   clientId = null;
   roomId = null;
+  resumeToken = null;
   isAdmin = false;
   adminToken = null;
   isMuted = false;
@@ -2032,29 +2205,19 @@ function leaveMeeting() {
   isInMeeting = false;
   participantsState.clear();
   
-  if (ws) {
-    try {
-      ws.close();
-    } catch (e) {
-      console.error('Error closing WebSocket:', e);
-    }
-    ws = null;
-  }
-  
   showLandingPage();
   showToast('Left the meeting', 'info');
-  
-  setTimeout(() => {
-    initWebSocket();
-  }, 1000);
+  if (!ws) setTimeout(initWebSocket, 300);
+  return true;
 }
 
 function sendSignalingMessage(message) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(message));
+    return true;
   } else {
-    console.error('❌ WebSocket not connected');
-    showToast('Connection lost. Please refresh.', 'error');
+    if (message.type !== 'authenticate') showToast('Connection lost. Reconnecting…', 'error');
+    return false;
   }
 }
 
