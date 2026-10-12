@@ -8,7 +8,7 @@ const configuredEndpoints = [
   },
   {
     name: 'Failover',
-    baseUrl: 'https://webrtc-meeting-server.onrender.com'
+    baseUrl: 'https://webrtc-meeting-server1.onrender.com'
   }
 ];
 
