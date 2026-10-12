@@ -28,6 +28,8 @@ let roomId = null;
 let resumeToken = null;
 let isAdmin = false;
 let adminToken = null;
+let roomAdminClientId = null;
+let pendingRoomCode = null;
 let isMuted = false;
 let isAdminMuted = false;
 let isCameraOff = false;
@@ -322,6 +324,11 @@ async function handleSignalingMessage(data) {
       showToast('Signed in successfully!', 'success');
       if (isInMeeting && roomId && resumeToken) {
         sendSignalingMessage({ type: 'resume_room', roomId, resumeToken });
+      } else if (pendingRoomCode && !isInMeeting) {
+        const autoCode = pendingRoomCode;
+        pendingRoomCode = null;
+        showToast(`Auto-joining meeting ${autoCode}...`, 'info');
+        joinRoomById(autoCode);
       }
       break;
 
@@ -350,26 +357,32 @@ async function handleSignalingMessage(data) {
       
     case 'room_created':
       roomId = data.roomId;
+      roomAdminClientId = clientId;
+      isAdmin = true;
       resumeToken = data.resumeToken || resumeToken;
       updateRoomDisplay();
       showToast(`Room created: ${roomId}`, 'success');
       roomActionPending = null;
       showMeetingRoom();
       hideLoading();
+      updateVideoGrid();
       break;
 
     case 'room_joined':
     case 'room_resumed':
       roomId = data.roomId || roomId;
       resumeToken = data.resumeToken || resumeToken;
+      if (data.adminClientId) roomAdminClientId = data.adminClientId;
       updateRoomDisplay();
       roomActionPending = null;
       showMeetingRoom();
       hideLoading();
       if (data.type === 'room_resumed') showToast('Meeting connection restored', 'success');
+      updateVideoGrid();
       break;
       
     case 'room_state':
+      if (data.adminClientId) roomAdminClientId = data.adminClientId;
       participantsState.clear();
       for (const p of Array.isArray(data.participants) ? data.participants : []) {
         if (p.clientId !== clientId) {
@@ -387,6 +400,7 @@ async function handleSignalingMessage(data) {
         }
       }
       updateParticipantsList();
+      updateVideoGrid();
       break;
       
     case 'peer_joined':
@@ -508,6 +522,7 @@ async function handleSignalingMessage(data) {
       
     case 'admin_changed':
       showToast(`${data.newAdminName} is now the host`, 'info');
+      roomAdminClientId = data.newAdminId;
       if (data.newAdminId === clientId) {
         isAdmin = true;
         updateAdminUI();
@@ -516,16 +531,23 @@ async function handleSignalingMessage(data) {
         updateAdminUI();
       }
       updateParticipantsList();
+      updateVideoGrid();
       break;
       
     case 'admin_transferred':
       showToast(`Admin transferred to ${data.newAdminName}`, 'info');
+      roomAdminClientId = data.newAdminId;
       isAdmin = false;
       updateAdminUI();
+      updateVideoGrid();
       break;
       
     case 'promoted_to_admin':
       showToast(`You are now the host (promoted by ${data.byUsername})`, 'success');
+      roomAdminClientId = clientId;
+      isAdmin = true;
+      updateAdminUI();
+      updateVideoGrid();
       break;
       
     case 'new_chat_message':
@@ -585,63 +607,64 @@ async function handleSignalingMessage(data) {
 
 // ===== NEW: CAPTIONS & TRANSLATION FUNCTIONALITY =====
 
+const clientTranslationCache = new Map();
+
 /**
- * Calls our backend proxy to translate text.
+ * Calls our backend proxy to translate text with caching and fast fallback.
  */
 async function translateText(text, sourceLang, targetLang, callback) {
-  // *** MODIFICATION: API Key Removed ***
-  // The API key is no longer here. We call our own backend.
-  
+  const cleanText = String(text || '').trim();
+  if (!cleanText || sourceLang === targetLang) {
+    callback(cleanText);
+    return;
+  }
+
+  const cacheKey = `${sourceLang}->${targetLang}:${cleanText.toLowerCase()}`;
+  if (clientTranslationCache.has(cacheKey)) {
+    callback(clientTranslationCache.get(cacheKey));
+    return;
+  }
+
   const apiUrl = SERVER_ENDPOINTS[currentServerIndex]?.translate;
   if (!apiUrl || !sessionToken) {
-    callback(text);
+    callback(cleanText);
     return;
   }
 
   try {
-    // Use exponential backoff for retries
-    let response;
-    let delay = 1000;
-    for (let i = 0; i < 3; i++) { // Retry up to 3 times
-      response = await fetch(apiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${sessionToken}`
-        },
-        body: JSON.stringify({
-          text,
-          sourceLang,
-          targetLang
-        })
-      });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6000);
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${sessionToken}`
+      },
+      body: JSON.stringify({
+        text: cleanText,
+        sourceLang,
+        targetLang
+      }),
+      signal: controller.signal
+    });
+    clearTimeout(timer);
 
-      if (response.ok) {
-        break; // Success
-      } else if (response.status === 429) { // Throttling
-        await new Promise(resolve => setTimeout(resolve, delay));
-        delay *= 2;
-      } else {
-        throw new Error(`API error: ${response.status} ${response.statusText}`);
+    if (response.ok) {
+      const result = await response.json();
+      if (result?.translatedText) {
+        if (clientTranslationCache.size >= 500) {
+          const oldest = clientTranslationCache.keys().next().value;
+          clientTranslationCache.delete(oldest);
+        }
+        clientTranslationCache.set(cacheKey, result.translatedText);
+        callback(result.translatedText);
+        return;
       }
     }
-
-    if (!response.ok) {
-      throw new Error('Translation failed after retries');
-    }
-
-    // *** MODIFICATION: Expect simple JSON { translatedText: "..." } from our server ***
-    const result = await response.json();
-    const translatedText = result.translatedText;
-
-    if (translatedText) {
-      callback(translatedText);
-    } else {
-      throw new Error(result.error || 'Invalid API response structure');
-    }
+    callback(cleanText);
   } catch (error) {
-    console.error('Translation failed:', error);
-    callback(text);
+    console.warn('Translation request error:', error.message);
+    callback(cleanText);
   }
 }
 
@@ -708,47 +731,44 @@ function displayCaption(username, text, isFinal, sourceLanguage = 'en-US') {
   const needsTranslation = !isOwnCaption && sourceLanguage && sourceLanguage !== myPreferredLanguage;
 
   if (!needsTranslation) {
-    // No translation needed, just render it
     renderCaption(username, text, isFinal);
     return;
   }
 
   // --- Translation is Needed ---
-
   if (isFinal) {
-    // Final text: Clear any pending interim translations and translate this.
     clearTimeout(translationTimeouts.get(username));
     translationTimeouts.delete(username);
-    translationCache.delete(username); // Clear cache for this user
+    translationCache.delete(username);
 
-    // Show a placeholder with the *original* text while translating
-    renderCaption(username, `${text} (Translating...)`, false); 
+    // If already in client cache, render instantly
+    const cacheKey = `${sourceLanguage}->${myPreferredLanguage}:${text.trim().toLowerCase()}`;
+    if (clientTranslationCache.has(cacheKey)) {
+      renderCaption(username, clientTranslationCache.get(cacheKey), true);
+      return;
+    }
+
+    renderCaption(username, `${text} (Translating…)`, false); 
 
     translateText(text, sourceLanguage, myPreferredLanguage, (translatedText) => {
-      renderCaption(username, translatedText, true); // Show final translation
+      renderCaption(username, translatedText, true);
     });
-
   } else {
-    // Interim text: Cache it and set a debounce timer.
-    // This prevents hammering the API for every single interim word.
+    // Interim text: rapid 350ms debounce
     translationCache.set(username, text);
-
     clearTimeout(translationTimeouts.get(username));
-
-    // Show interim in original language (faded)
     renderCaption(username, text, false);
 
     const timeout = setTimeout(() => {
       const cachedText = translationCache.get(username);
       if (cachedText) {
         translateText(cachedText, sourceLanguage, myPreferredLanguage, (translatedText) => {
-          // Render this interim translation, but mark it as interim (faded)
           renderCaption(username, translatedText, false);
         });
         translationCache.delete(username);
       }
       translationTimeouts.delete(username);
-    }, 1000); // Wait 1 second after last interim result before translating
+    }, 350);
     translationTimeouts.set(username, timeout);
   }
 }
@@ -866,7 +886,11 @@ function startCaptions() {
     updateCaptionsButton();
     
     // Show captions container
-    document.getElementById('captionsContainer').classList.remove('hidden');
+    const container = document.getElementById('captionsContainer');
+    if (container) {
+      container.classList.remove('hidden');
+      container.removeAttribute('aria-hidden');
+    }
     
     showToast(`Captions started (Speaking ${CAPTION_LANGUAGES[captionLanguage]})`, 'success');
   } catch (err) {
@@ -889,6 +913,13 @@ function stopCaptions() {
   translationTimeouts.clear();
   translationCache.clear();
   updateCaptionsButton();
+  
+  // Hide captions container
+  const container = document.getElementById('captionsContainer');
+  if (container) {
+    container.classList.add('hidden');
+    container.setAttribute('aria-hidden', 'true');
+  }
   
   // Clear caption display
   clearCaptions();
@@ -1076,22 +1107,25 @@ async function createRoom() {
   }
 }
 
-async function joinRoomPrompt() {
-  if (!googleUser) {
-    showToast('Please sign in first', 'error');
-    return;
-  }
-  
-  const input = document.getElementById('roomIdInput');
-  const id = input.value.trim().toUpperCase();
-  
+async function joinRoomById(targetRoomId) {
+  const id = String(targetRoomId || '').trim().toUpperCase();
   if (!id) {
     showToast('Please enter a room code', 'error');
     return;
   }
   
+  if (!googleUser) {
+    pendingRoomCode = id;
+    const input = document.getElementById('roomIdInput');
+    if (input) input.value = id;
+    showToast('Please sign in with Google to enter meeting', 'info');
+    return;
+  }
+  
   if (!ws || ws.readyState !== WebSocket.OPEN) {
-    showToast('Not connected to server', 'error');
+    pendingRoomCode = id;
+    showToast('Connecting to server...', 'info');
+    initWebSocket();
     return;
   }
   
@@ -1103,9 +1137,15 @@ async function joinRoomPrompt() {
     sendSignalingMessage({ type: 'join_room', roomId: id });
   } catch (err) {
     console.error('Failed to join room:', err);
-    showToast('Failed to join room', 'error');
+    showToast('Failed to join room: ' + (err.message || 'Stream error'), 'error');
     hideLoading();
   }
+}
+
+async function joinRoomPrompt() {
+  const input = document.getElementById('roomIdInput');
+  const id = input ? input.value.trim().toUpperCase() : '';
+  await joinRoomById(id);
 }
 
 function updateRoomDisplay() {
@@ -1120,16 +1160,117 @@ function copyRoomId() {
   
   navigator.clipboard.writeText(roomId).then(() => {
     const btn = document.getElementById('copyRoomBtn');
-    const originalHTML = btn.innerHTML;
-    btn.innerHTML = '<i class="fas fa-check"></i> Copied!';
-    setTimeout(() => {
-      btn.innerHTML = originalHTML;
-    }, 2000);
+    if (btn) {
+      const originalHTML = btn.innerHTML;
+      btn.innerHTML = '<i class="fas fa-check"></i> Copied!';
+      setTimeout(() => {
+        btn.innerHTML = originalHTML;
+      }, 2000);
+    }
     showToast('Room code copied to clipboard', 'success');
   }).catch(err => {
     console.error('Failed to copy:', err);
-    showToast('Failed to copy room code', 'error');
+    copyTextFallback(roomId);
+    showToast('Room code copied to clipboard', 'success');
   });
+}
+
+function copyTextFallback(text) {
+  const tempInput = document.createElement('input');
+  tempInput.value = text;
+  tempInput.style.position = 'fixed';
+  tempInput.style.opacity = '0';
+  document.body.appendChild(tempInput);
+  tempInput.select();
+  try {
+    document.execCommand('copy');
+  } catch (e) {
+    console.error('Fallback execCommand copy failed:', e);
+  }
+  document.body.removeChild(tempInput);
+}
+
+function copyMeetingLink() {
+  if (!roomId) {
+    showToast('No active meeting room', 'error');
+    return;
+  }
+  
+  const url = new URL(window.location.href);
+  url.searchParams.set('room-code', roomId);
+  const inviteUrl = url.toString();
+  
+  const finishCopy = () => {
+    const btn = document.getElementById('copyLinkBtn');
+    if (btn) {
+      const originalHTML = btn.innerHTML;
+      btn.innerHTML = '<i class="fas fa-check"></i> Link copied!';
+      setTimeout(() => {
+        btn.innerHTML = originalHTML;
+      }, 2000);
+    }
+    showToast('Meeting link copied! Share this link to invite others.', 'success');
+  };
+
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(inviteUrl).then(finishCopy).catch(() => {
+      copyTextFallback(inviteUrl);
+      finishCopy();
+    });
+  } else {
+    copyTextFallback(inviteUrl);
+    finishCopy();
+  }
+}
+
+function checkUrlRoomCode() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('room-code') || 
+                 params.get('room_code') || 
+                 params.get('room') || 
+                 params.get('roomId');
+    
+    let hashVal = '';
+    if (window.location.hash) {
+      const hash = window.location.hash.substring(1);
+      if (hash.includes('=')) {
+        const hashParams = new URLSearchParams(hash);
+        hashVal = hashParams.get('room-code') || hashParams.get('room_code') || hashParams.get('room');
+      } else if (/^[A-Za-z0-9]{4,10}$/.test(hash)) {
+        hashVal = hash;
+      }
+    }
+
+    const roomCode = (code || hashVal || '').trim().toUpperCase();
+    if (roomCode) {
+      pendingRoomCode = roomCode;
+      const input = document.getElementById('roomIdInput');
+      if (input) input.value = roomCode;
+      
+      const inviteNotice = document.getElementById('roomInviteNotice');
+      const codeDisplay = document.getElementById('inviteCodeDisplay');
+      if (inviteNotice && codeDisplay) {
+        codeDisplay.textContent = roomCode;
+        inviteNotice.classList.remove('hidden');
+      }
+      
+      const authStatus = document.getElementById('authStatus');
+      if (authStatus && !googleUser) {
+        authStatus.textContent = `Sign in with Google to enter meeting ${roomCode}`;
+      }
+      
+      console.log(`🔗 Detected meeting invitation room code in URL: ${roomCode}`);
+      
+      if (googleUser && ws && ws.readyState === WebSocket.OPEN && !isInMeeting) {
+        const toJoin = pendingRoomCode;
+        pendingRoomCode = null;
+        joinRoomById(toJoin);
+      }
+    }
+  } catch (e) {
+    console.warn('Error reading URL room code:', e);
+  }
 }
 
 // ===== LOCAL STREAM SETUP =====
@@ -1528,11 +1669,60 @@ function syncLocalVideoIdentity(previousId, nextId) {
   });
 }
 
+function detectOrientation() {
+  if (window.matchMedia && window.matchMedia('(orientation: portrait)').matches) {
+    return 'portrait';
+  }
+  if (window.innerHeight > window.innerWidth) {
+    return 'portrait';
+  }
+  return 'landscape';
+}
+
 function updateVideoGrid() {
   const grid = document.getElementById('videoGrid');
+  if (!grid) return;
   const count = grid.children.length;
+  const orientation = detectOrientation();
   grid.setAttribute('data-count', count);
-  console.log(`📊 Video grid updated: ${count} participants`);
+  grid.setAttribute('data-orientation', orientation);
+
+  // Identify the host wrapper element
+  let hostEl = null;
+  if (roomAdminClientId) {
+    hostEl = document.getElementById(`video-${roomAdminClientId}`);
+  }
+  if (!hostEl && isAdmin) {
+    hostEl = (clientId ? document.getElementById(`video-${clientId}`) : null) || document.getElementById('video-local');
+  }
+
+  // Prepend host element to guarantee it stays in position 1 (:first-child)
+  if (hostEl && grid.firstElementChild !== hostEl) {
+    grid.prepend(hostEl);
+  }
+
+  // Update .is-host styling and badges on all participant video wrappers
+  Array.from(grid.children).forEach(child => {
+    const isThisHost = child === hostEl;
+    child.classList.toggle('is-host', isThisHost);
+
+    let hostBadge = child.querySelector('.host-badge');
+    if (isThisHost) {
+      if (!hostBadge) {
+        const overlay = child.querySelector('.video-overlay');
+        if (overlay) {
+          hostBadge = document.createElement('span');
+          hostBadge.className = 'host-badge';
+          hostBadge.innerHTML = '<i class="fas fa-crown"></i> Host';
+          overlay.insertBefore(hostBadge, overlay.firstChild);
+        }
+      }
+    } else if (hostBadge) {
+      hostBadge.remove();
+    }
+  });
+
+  console.log(`📊 Video grid updated: ${count} participants, orientation: ${orientation}, host: ${hostEl ? hostEl.id : 'unknown'}`);
 }
 
 function removeVideoElement(id) {
@@ -2282,6 +2472,20 @@ document.addEventListener('DOMContentLoaded', async () => {
       return '';
     }
   });
+
+  // Check URL query parameters for meeting invitation link (?room-code=XYZ)
+  checkUrlRoomCode();
+
+  // Automatic layout adaptation on window resize and mobile device rotation
+  window.addEventListener('resize', updateVideoGrid);
+  window.addEventListener('orientationchange', () => {
+    setTimeout(updateVideoGrid, 100);
+  });
+  if (window.screen && window.screen.orientation) {
+    window.screen.orientation.addEventListener('change', () => {
+      setTimeout(updateVideoGrid, 100);
+    });
+  }
   
   console.log('✅ App initialized successfully');
 });
@@ -2289,7 +2493,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 // ===== EXPOSE FUNCTIONS TO WINDOW =====
 window.createRoom = createRoom;
 window.joinRoomPrompt = joinRoomPrompt;
+window.joinRoomById = joinRoomById;
 window.copyRoomId = copyRoomId;
+window.copyMeetingLink = copyMeetingLink;
 window.toggleMic = toggleMic;
 window.toggleCamera = toggleCamera;
 window.toggleRaiseHand = toggleRaiseHand;

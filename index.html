@@ -20,6 +20,14 @@
       </div>
       
       <div class="auth-card">
+        <div id="roomInviteNotice" class="room-invite-notice hidden" role="status" aria-live="polite">
+          <i class="fas fa-link"></i>
+          <div class="room-invite-notice-content">
+            <div class="room-invite-notice-title">Meeting Invitation</div>
+            <div class="room-invite-notice-code">Room: <strong id="inviteCodeDisplay"></strong></div>
+            <div class="room-invite-notice-subtitle">Sign in with Google to enter automatically</div>
+          </div>
+        </div>
         <div id="gSignInDiv" class="google-signin" aria-label="Sign in with Google"></div>
         <p id="authStatus" class="auth-status" aria-live="polite">Sign in to continue</p>
         
@@ -60,9 +68,13 @@
           <i class="fas fa-video"></i>
           <span id="roomDisplay">Room: Not connected</span>
         </div>
-        <button class="btn-copy" id="copyRoomBtn" onclick="copyRoomId()">
+        <button class="btn-copy" id="copyRoomBtn" onclick="copyRoomId()" title="Copy Meeting Code" aria-label="Copy meeting code">
           <i class="fas fa-copy"></i>
           Copy code
+        </button>
+        <button class="btn-copy btn-copy-link" id="copyLinkBtn" onclick="copyMeetingLink()" title="Copy Meeting Link" aria-label="Copy meeting link">
+          <i class="fas fa-link"></i>
+          Copy link
         </button>
       </div>
       
@@ -91,9 +103,14 @@
         <div id="captionsContainer" class="captions-container hidden" role="log" aria-live="polite" aria-label="Live captions">
         <div class="captions-header">
           <span>Live Captions</span>
-          <button class="btn-icon-small" onclick="showCaptionSettings()" title="Caption Settings">
-            <i class="fas fa-cog"></i>
-          </button>
+          <div class="captions-header-actions">
+            <button class="btn-icon-small" onclick="showCaptionSettings()" title="Caption Settings" aria-label="Caption settings">
+              <i class="fas fa-cog"></i>
+            </button>
+            <button class="btn-icon-small" onclick="stopCaptions()" title="Close Captions" aria-label="Close captions">
+              <i class="fas fa-times"></i>
+            </button>
+          </div>
         </div>
         <div id="captionsDisplay" class="captions-display">
           <!-- Live captions will appear here -->
