@@ -23,6 +23,7 @@ let googleCredential = null;
 let sessionToken = null;
 let ws = null;
 let socketAuthenticated = false;
+let signalingSocketEpoch = 0;
 let localStream = null;
 let screenStream = null;
 let clientId = null;
@@ -51,7 +52,10 @@ let peers = {};
 let pendingIceCandidates = new Map();
 let participantsState = new Map();
 let pcConfig = {
-  iceServers: [],
+  // Keep a usable baseline immediately. The authenticated /ice request can
+  // replace this with TURN credentials, but peer creation must never see an
+  // empty ICE configuration if the user joins while that request is pending.
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
   iceCandidatePoolSize: 10,
   bundlePolicy: 'max-bundle',
   rtcpMuxPolicy: 'require'
@@ -144,6 +148,13 @@ function showToast(message, type = 'info') {
 
 function isSafeClientId(value) {
   return value === 'local' || (typeof value === 'string' && /^[a-f0-9-]{36}$/i.test(value));
+}
+
+// One side must own initial negotiation for each pair. Using the same stable
+// UUID ordering on both clients prevents offer glare when a room is resumed
+// or both browsers process room state at the same time.
+function shouldInitiatePeer(targetId) {
+  return isSafeClientId(clientId) && isSafeClientId(targetId) && clientId < targetId;
 }
 
 function handleActionClick(event) {
@@ -362,6 +373,7 @@ function signOut() {
 async function loadIceServers() {
   if (SERVER_ENDPOINTS.length === 0) {
     pcConfig.iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
+    pcConfig.iceTransportPolicy = 'all';
     return;
   }
 
@@ -387,6 +399,7 @@ async function loadIceServers() {
   }
 
   pcConfig.iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
+  pcConfig.iceTransportPolicy = 'all';
 }
 
 // ===== WEBSOCKET CONNECTION =====
@@ -398,6 +411,7 @@ function initWebSocket() {
   }
 
   const currentEndpoint = SERVER_ENDPOINTS[currentServerIndex];
+  const socketEpoch = ++signalingSocketEpoch;
   intentionalSocketClose = false;
   const socket = new WebSocket(currentEndpoint.ws);
   ws = socket;
@@ -418,7 +432,7 @@ function initWebSocket() {
     if (ws !== socket) return;
     try {
       const data = JSON.parse(evt.data);
-      await handleSignalingMessage(data);
+      await handleSignalingMessage(data, socketEpoch);
     } catch (err) {
       console.error('Failed to parse message:', err);
     }
@@ -443,6 +457,7 @@ function initWebSocket() {
 
     ws = null;
     socketAuthenticated = false;
+    if (isInMeeting) resetPeerConnections('signaling socket closed');
     if (intentionalSocketClose) return;
     if (!googleCredential) {
       updateConnectionStatus(false, 'Sign in to connect');
@@ -464,7 +479,8 @@ function initWebSocket() {
 }
 
 // ===== SIGNALING MESSAGE HANDLER =====
-async function handleSignalingMessage(data) {
+async function handleSignalingMessage(data, socketEpoch = signalingSocketEpoch) {
+  if (socketEpoch !== signalingSocketEpoch) return;
   console.log('📩 Received:', data.type);
 
   switch (data.type) {
@@ -475,12 +491,13 @@ async function handleSignalingMessage(data) {
       sessionToken = data.sessionToken || null;
       renderAuthenticatedUser(data.user);
       await loadIceServers();
+      if (socketEpoch !== signalingSocketEpoch || ws?.readyState !== WebSocket.OPEN) return;
       showToast('Signed in successfully!', 'success');
       if (isInMeeting && roomId && resumeToken) {
-        sendSignalingMessage({ type: 'resume_room', roomId, resumeToken });
+        sendSignalingMessage({ type: 'resume_room', roomId, resumeToken }, socketEpoch);
       } else if (pendingAdmissionRoomId && !isInMeeting) {
         roomActionPending = 'prepare_join';
-        sendSignalingMessage({ type: 'prepare_room', action: 'join', roomId: pendingAdmissionRoomId });
+        sendSignalingMessage({ type: 'prepare_room', action: 'join', roomId: pendingAdmissionRoomId }, socketEpoch);
       } else if (pendingRoomCode && !isInMeeting) {
         const autoCode = pendingRoomCode;
         pendingRoomCode = null;
@@ -559,7 +576,9 @@ async function handleSignalingMessage(data) {
           });
           addParticipantToList(p.clientId, p.username, p.handRaised, p.isAdminMuted);
           updateParticipantCameraStatus(p.clientId, p.isCameraOff, p.username);
-          if (p.connected !== false) await createOffer(p.clientId, p.username);
+          if (p.connected !== false && shouldInitiatePeer(p.clientId)) {
+            await createOffer(p.clientId, p.username, socketEpoch);
+          }
         }
       }
       updateParticipantsList();
@@ -578,9 +597,13 @@ async function handleSignalingMessage(data) {
       });
       addParticipantToList(data.clientId, data.username, !!data.handRaised, !!data.isAdminMuted);
       updateParticipantCameraStatus(data.clientId, data.isCameraOff, data.username);
+      if (data.connected !== false && shouldInitiatePeer(data.clientId)) {
+        await createOffer(data.clientId, data.username, socketEpoch);
+      }
       break;
 
     case 'peer_reconnected':
+      removePeer(data.clientId);
       participantsState.set(data.clientId, {
         username: data.username,
         picture: data.picture,
@@ -591,6 +614,9 @@ async function handleSignalingMessage(data) {
       });
       addParticipantToList(data.clientId, data.username, !!data.handRaised, !!data.isAdminMuted);
       updateParticipantCameraStatus(data.clientId, data.isCameraOff, data.username);
+      if (shouldInitiatePeer(data.clientId)) {
+        await createOffer(data.clientId, data.username, socketEpoch);
+      }
       break;
 
     case 'peer_disconnected':
@@ -632,8 +658,9 @@ async function handleSignalingMessage(data) {
       if (data.action === 'create') {
         try {
           await setupLocalStream();
+          if (socketEpoch !== signalingSocketEpoch || ws?.readyState !== WebSocket.OPEN) return;
           roomActionPending = 'create';
-          sendSignalingMessage({ type: 'create_room' });
+          sendSignalingMessage({ type: 'create_room' }, socketEpoch);
         } catch (error) {
           roomActionPending = null;
           hideLoading();
@@ -641,7 +668,7 @@ async function handleSignalingMessage(data) {
       } else if (data.action === 'join' && data.roomId) {
         pendingAdmissionRoomId = data.roomId;
         roomActionPending = 'request_join';
-        sendSignalingMessage({ type: 'request_join', roomId: data.roomId });
+        sendSignalingMessage({ type: 'request_join', roomId: data.roomId }, socketEpoch);
       }
       break;
 
@@ -682,13 +709,14 @@ async function handleSignalingMessage(data) {
       showLoading('Host admitted you. Preparing your camera…');
       try {
         await setupLocalStream();
+        if (socketEpoch !== signalingSocketEpoch || ws?.readyState !== WebSocket.OPEN) return;
         sendSignalingMessage({
           type: 'join_room',
           roomId: pendingAdmissionRoomId,
           admissionToken: pendingAdmissionToken
-        });
+        }, socketEpoch);
       } catch (error) {
-        sendSignalingMessage({ type: 'cancel_join_request', requestId: pendingAdmissionRequestId });
+        sendSignalingMessage({ type: 'cancel_join_request', requestId: pendingAdmissionRequestId }, socketEpoch);
         clearAdmissionState();
         hideLoading();
       }
@@ -721,15 +749,15 @@ async function handleSignalingMessage(data) {
       break;
 
     case 'offer':
-      if (isSafeClientId(data.from || data.fromId)) await handleOffer(data.from || data.fromId, data.fromUsername, data.sdp);
+      if (isSafeClientId(data.from || data.fromId)) await handleOffer(data.from || data.fromId, data.fromUsername, data.sdp, socketEpoch);
       break;
 
     case 'answer':
-      if (isSafeClientId(data.from || data.fromId)) await handleAnswer(data.from || data.fromId, data.sdp);
+      if (isSafeClientId(data.from || data.fromId)) await handleAnswer(data.from || data.fromId, data.sdp, socketEpoch);
       break;
 
     case 'ice_candidate':
-      if (isSafeClientId(data.from || data.fromId)) await handleIceCandidate(data.from || data.fromId, data.candidate);
+      if (isSafeClientId(data.from || data.fromId)) await handleIceCandidate(data.from || data.fromId, data.candidate, socketEpoch);
       break;
 
     case 'force_mute':
@@ -854,6 +882,7 @@ async function handleSignalingMessage(data) {
       break;
 
     case 'disconnected':
+      resetPeerConnections('signaling connection lost');
       updateConnectionStatus(false);
       break;
 
@@ -2752,9 +2781,15 @@ function getRemoteTrackRole(peer, transceiver) {
 }
 
 function attachRemoteTrack(id, username, peer, event) {
-  if (!peer || !event?.track || !event.transceiver) return;
+  if (!peer || !event?.track) return;
 
-  const role = getRemoteTrackRole(peer, event.transceiver);
+  let role = getRemoteTrackRole(peer, event.transceiver);
+  if (!role && event.track.kind === 'video') {
+    // A few WebRTC implementations have delivered ontrack without a usable
+    // transceiver/mid. The fixed m-line order still gives us a safe fallback:
+    // the first remote video is camera, the second is screen.
+    role = peer.remoteMediaStream.getVideoTracks().length > 0 ? 'screen' : 'camera';
+  }
   if (role === 'screen') {
     if (!peer.remoteScreenStream.getTracks().includes(event.track)) {
       peer.remoteScreenStream.addTrack(event.track);
@@ -2768,21 +2803,10 @@ function attachRemoteTrack(id, username, peer, event) {
     return;
   }
 
-  if (role !== 'camera' && role !== 'audio') {
-    console.warn('Received a track with an unknown media role:', {
-      remoteId: id,
-      kind: event.track.kind,
-      mid: event.transceiver.mid,
-      transceivers: peer.pc.getTransceivers().map(transceiver => ({
-        mid: transceiver.mid,
-        kind: transceiver.receiver?.track?.kind,
-        direction: transceiver.direction,
-        currentDirection: transceiver.currentDirection
-      }))
-    });
-    return;
-  }
-
+  // Camera and microphone are the default remote media path. Do not drop a
+  // valid track just because a browser has not exposed its transceiver/mid at
+  // the moment the ontrack event is delivered. Only a positively identified
+  // screen transceiver belongs in the presentation stage.
   if (!peer.remoteMediaStream.getTracks().includes(event.track)) {
     peer.remoteMediaStream.addTrack(event.track);
   }
@@ -2806,6 +2830,7 @@ function createPeerConnection(id, username) {
   const peer = {
     pc,
     username,
+    signalingEpoch: signalingSocketEpoch,
     cameraTransceiver: null,
     audioTransceiver: null,
     cameraSender: null,
@@ -2876,7 +2901,7 @@ function createPeerConnection(id, username) {
         type: 'ice_candidate',
         candidate: event.candidate,
         targetClientId: id
-      });
+      }, peer.signalingEpoch);
     }
   };
 
@@ -2889,14 +2914,16 @@ function createPeerConnection(id, username) {
       console.error(`❌ Connection FAILED for ${id}`);
       setTimeout(async () => {
         try {
+          if (!shouldInitiatePeer(id) || pc.signalingState !== 'stable' || peer.signalingEpoch !== signalingSocketEpoch) return;
           if (pc.restartIce) pc.restartIce();
+          peer.remoteDescriptionSet = false;
           const offer = await pc.createOffer({ iceRestart: true });
           await pc.setLocalDescription(offer);
           sendSignalingMessage({
             type: 'offer',
             sdp: pc.localDescription,
             targetClientId: id
-          });
+          }, peer.signalingEpoch);
         } catch (err) {
           console.error(`❌ ICE restart failed for ${id}:`, err);
         }
@@ -2907,14 +2934,22 @@ function createPeerConnection(id, username) {
   return pc;
 }
 
-async function createOffer(targetId, targetUsername) {
+async function createOffer(targetId, targetUsername, socketEpoch = signalingSocketEpoch) {
   if (!isSafeClientId(targetId)) return;
+  if (socketEpoch !== signalingSocketEpoch) return;
   console.log(`📤 Creating offer for ${targetId}`);
 
   const pc = createPeerConnection(targetId, targetUsername);
   const peer = peers[targetId];
 
   try {
+    if (socketEpoch !== signalingSocketEpoch || !peer || pc.signalingState !== 'stable') {
+      console.warn(`⏭️ Skipping offer for ${targetId}; signaling state is ${pc.signalingState}`);
+      return;
+    }
+    // Candidates emitted for this offer must wait until its answer becomes
+    // the current remote description, including ICE-restart offers.
+    peer.remoteDescriptionSet = false;
     await peer.mediaReady;
     const offer = await pc.createOffer({
       offerToReceiveAudio: true,
@@ -2927,7 +2962,7 @@ async function createOffer(targetId, targetUsername) {
       type: 'offer',
       sdp: pc.localDescription,
       targetClientId: targetId
-    });
+    }, socketEpoch);
 
     console.log(`📨 Offer sent to ${targetId}`);
   } catch (err) {
@@ -2935,14 +2970,28 @@ async function createOffer(targetId, targetUsername) {
   }
 }
 
-async function handleOffer(fromId, fromUsername, sdp) {
+async function handleOffer(fromId, fromUsername, sdp, socketEpoch = signalingSocketEpoch) {
+  if (socketEpoch !== signalingSocketEpoch) return;
   console.log(`📥 Received offer from ${fromId}`);
 
   const pc = createPeerConnection(fromId, fromUsername);
   const peer = peers[fromId];
 
   try {
+    if (pc.signalingState === 'have-local-offer') {
+      if (shouldInitiatePeer(fromId)) {
+        console.warn(`⏭️ Ignoring colliding offer from ${fromId}`);
+        return;
+      }
+      await pc.setLocalDescription({ type: 'rollback' });
+    }
+    if (pc.signalingState !== 'stable') {
+      console.warn(`⏭️ Ignoring offer from ${fromId} in state ${pc.signalingState}`);
+      return;
+    }
+    peer.remoteDescriptionSet = false;
     await peer.mediaReady;
+    if (socketEpoch !== signalingSocketEpoch) return;
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
     peer.remoteDescriptionSet = true;
     flushPendingRemoteTracks(fromId, fromUsername, peer);
@@ -2961,7 +3010,7 @@ async function handleOffer(fromId, fromUsername, sdp) {
       type: 'answer',
       sdp: pc.localDescription,
       targetClientId: fromId
-    });
+    }, socketEpoch);
 
     console.log(`📨 Answer sent to ${fromId}`);
   } catch (err) {
@@ -2969,14 +3018,21 @@ async function handleOffer(fromId, fromUsername, sdp) {
   }
 }
 
-async function handleAnswer(fromId, sdp) {
+async function handleAnswer(fromId, sdp, socketEpoch = signalingSocketEpoch) {
+  if (socketEpoch !== signalingSocketEpoch) return;
   console.log(`📥 Received answer from ${fromId}`);
 
   const peer = peers[fromId];
   if (!peer) return;
 
   try {
+    if (peer.pc.signalingState !== 'have-local-offer') {
+      console.warn(`⏭️ Ignoring stale answer from ${fromId} in state ${peer.pc.signalingState}`);
+      return;
+    }
+    peer.remoteDescriptionSet = false;
     await peer.pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    if (socketEpoch !== signalingSocketEpoch) return;
     peer.remoteDescriptionSet = true;
     flushPendingRemoteTracks(fromId, peer.username, peer);
 
@@ -2991,7 +3047,8 @@ async function handleAnswer(fromId, sdp) {
   }
 }
 
-async function handleIceCandidate(fromId, candidate) {
+async function handleIceCandidate(fromId, candidate, socketEpoch = signalingSocketEpoch) {
+  if (socketEpoch !== signalingSocketEpoch) return;
   const peer = peers[fromId];
   if (!peer) {
     const queued = pendingIceCandidates.get(fromId) || [];
@@ -3539,6 +3596,30 @@ function showLandingPage() {
   closeSidePanel();
 }
 
+function resetPeerConnections(reason = 'reset') {
+  // Invalidate async offer/answer work from the connection that is being
+  // discarded before any replacement peer can be created.
+  signalingSocketEpoch += 1;
+  const peerIds = Object.keys(peers);
+  if (peerIds.length > 0) {
+    console.log(`♻️ Resetting ${peerIds.length} peer connection(s): ${reason}`);
+  }
+  peerIds.forEach(id => {
+    try {
+      peers[id].pc.close();
+    } catch (error) {
+      console.warn(`Could not close peer ${id}:`, error.message);
+    }
+    removeVideoElement(id);
+  });
+  peers = {};
+  pendingIceCandidates.clear();
+
+  if (screenShareOwnerId && screenShareOwnerId !== clientId) {
+    clearScreenStage(screenShareOwnerId);
+  }
+}
+
 function removePeer(id) {
   if (!isSafeClientId(id)) return;
   console.log(`🗑️ Removing peer: ${id}`);
@@ -3631,7 +3712,8 @@ function leaveMeeting(force = false) {
   return true;
 }
 
-function sendSignalingMessage(message) {
+function sendSignalingMessage(message, socketEpoch = null) {
+  if (socketEpoch !== null && socketEpoch !== signalingSocketEpoch) return false;
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(message));
     return true;
