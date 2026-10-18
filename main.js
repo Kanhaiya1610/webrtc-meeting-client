@@ -2176,8 +2176,12 @@ async function toggleScreenShare() {
     try {
       console.log('🖥️ Starting screen share...');
 
+      if (!window.isSecureContext || !navigator.mediaDevices?.getDisplayMedia) {
+        throw new Error('Screen sharing is not supported in this browser or context. Use HTTPS and a supported browser.');
+      }
+      const isMobileBrowser = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '');
       screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: {
+        video: isMobileBrowser ? true : {
           cursor: 'always',
           displaySurface: 'monitor'
         },
@@ -2200,7 +2204,13 @@ async function toggleScreenShare() {
 
     } catch (err) {
       console.error('❌ Screen share failed:', err);
-      showToast('Failed to start screen sharing', 'error');
+      if (err?.name === 'NotAllowedError') {
+        showToast('Screen sharing was cancelled or blocked by the browser.', 'info');
+      } else if (err?.name === 'NotSupportedError' || /not supported/i.test(err?.message || '')) {
+        showToast('Screen sharing is not supported in this browser. Use HTTPS or a supported browser.', 'error');
+      } else {
+        showToast('Screen sharing could not start. Check browser permissions and try again.', 'error');
+      }
     }
   } else {
     stopScreenShare();
@@ -2553,6 +2563,15 @@ function initPresenterOverlayDrag() {
   overlay.addEventListener('pointercancel', release);
 }
 
+function resumeRemotePlayback() {
+  document.querySelectorAll('#videoGrid video, #screenStageVideo').forEach(video => {
+    if (!video.srcObject || video.muted) return;
+    video.play().catch(() => {
+      // The browser may still require another gesture; retry on the next one.
+    });
+  });
+}
+
 function requestVideoPlayback(video, isLocal = false) {
   if (!video || isLocal) return;
   const play = () => {
@@ -2733,10 +2752,35 @@ function bindNegotiatedScreenTransceiver(peer) {
   } catch (error) {
     console.warn('Could not set negotiated screen direction:', error.message);
   }
-  candidate.sender.replaceTrack(getPublishedScreenVideoTrack()).catch(error => {
-    console.warn('Could not attach the current screen track:', error.message);
-  });
   return candidate;
+}
+
+function attachRemoteTrack(id, username, peer, event) {
+  if (!peer || !event?.track) return;
+  const isScreenTrack = event.track.kind === 'video' &&
+    event.transceiver === peer.screenTransceiver;
+  if (isScreenTrack) {
+    if (!peer.remoteScreenStream.getTracks().includes(event.track)) {
+      peer.remoteScreenStream.addTrack(event.track);
+    }
+    const revealScreen = () => {
+      if (event.track.readyState === 'live') showScreenStage(id, peer.remoteScreenStream);
+    };
+    event.track.onunmute = revealScreen;
+    event.track.onended = () => clearScreenStage(id);
+    if (!event.track.muted) revealScreen();
+    return;
+  }
+
+  if (!peer.remoteMediaStream.getTracks().includes(event.track)) {
+    peer.remoteMediaStream.addTrack(event.track);
+  }
+  addVideoElement(id, peer.remoteMediaStream, false, username);
+}
+
+function flushPendingRemoteTracks(id, username, peer) {
+  const pending = peer?.pendingRemoteTracks?.splice(0) || [];
+  pending.forEach(event => attachRemoteTrack(id, username, peer, event));
 }
 
 function createPeerConnection(id, username) {
@@ -2758,6 +2802,8 @@ function createPeerConnection(id, username) {
     screenTransceiver: null,
     remoteMediaStream: new MediaStream(),
     remoteScreenStream: new MediaStream(),
+    pendingRemoteTracks: [],
+    mediaReady: Promise.resolve(),
     iceCandidateQueue: [],
     remoteDescriptionSet: false
   };
@@ -2770,11 +2816,11 @@ function createPeerConnection(id, username) {
     peer.audioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
     peer.cameraSender = peer.cameraTransceiver.sender;
     peer.audioSender = peer.audioTransceiver.sender;
-    peer.cameraSender.replaceTrack(videoTrack || null).catch(error => {
-      console.warn(`Could not attach camera to peer ${id}:`, error.message);
-    });
-    peer.audioSender.replaceTrack(audioTrack || null).catch(error => {
-      console.warn(`Could not attach microphone to peer ${id}:`, error.message);
+    peer.mediaReady = Promise.all([
+      peer.cameraSender.replaceTrack(videoTrack || null),
+      peer.audioSender.replaceTrack(audioTrack || null)
+    ]).catch(error => {
+      console.warn(`Could not attach initial media to peer ${id}:`, error.message);
     });
   } else {
     const publicationStream = new MediaStream();
@@ -2792,29 +2838,11 @@ function createPeerConnection(id, username) {
     console.log(`🎥 Received ${event.track.kind} track from ${id}`);
     const currentPeer = peers[id];
     if (!currentPeer) return;
-
-    const isScreenTrack = event.track.kind === 'video' && event.transceiver && (
-      event.transceiver === currentPeer.screenTransceiver ||
-      event.transceiver !== currentPeer.cameraTransceiver
-    );
-    if (isScreenTrack) {
-      currentPeer.screenTransceiver ||= event.transceiver;
-      if (!currentPeer.remoteScreenStream.getTracks().includes(event.track)) {
-        currentPeer.remoteScreenStream.addTrack(event.track);
-      }
-      const revealScreen = () => {
-        if (event.track.readyState === 'live') showScreenStage(id, currentPeer.remoteScreenStream);
-      };
-      event.track.onunmute = revealScreen;
-      event.track.onended = () => clearScreenStage(id);
-      if (!event.track.muted) revealScreen();
+    if (!currentPeer.remoteDescriptionSet) {
+      currentPeer.pendingRemoteTracks.push(event);
       return;
     }
-
-    if (!currentPeer.remoteMediaStream.getTracks().includes(event.track)) {
-      currentPeer.remoteMediaStream.addTrack(event.track);
-    }
-    addVideoElement(id, currentPeer.remoteMediaStream, false, username);
+    attachRemoteTrack(id, username, currentPeer, event);
   };
 
   pc.onicecandidate = event => {
@@ -2862,6 +2890,7 @@ async function createOffer(targetId, targetUsername) {
   const peer = peers[targetId];
 
   try {
+    await peer.mediaReady;
     const screenTransceiver = ensureScreenTransceiver(peer);
     if (screenTransceiver) {
       await screenTransceiver.sender.replaceTrack(getPublishedScreenVideoTrack());
@@ -2892,9 +2921,14 @@ async function handleOffer(fromId, fromUsername, sdp) {
   const peer = peers[fromId];
 
   try {
+    await peer.mediaReady;
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-    bindNegotiatedScreenTransceiver(peer);
+    const screenTransceiver = bindNegotiatedScreenTransceiver(peer);
+    if (screenTransceiver) {
+      await screenTransceiver.sender.replaceTrack(getPublishedScreenVideoTrack() || null);
+    }
     peer.remoteDescriptionSet = true;
+    flushPendingRemoteTracks(fromId, fromUsername, peer);
 
     if (peer.iceCandidateQueue.length > 0) {
       for (const candidate of peer.iceCandidateQueue) {
@@ -2927,6 +2961,7 @@ async function handleAnswer(fromId, sdp) {
   try {
     await peer.pc.setRemoteDescription(new RTCSessionDescription(sdp));
     peer.remoteDescriptionSet = true;
+    flushPendingRemoteTracks(fromId, peer.username, peer);
 
     if (peer.iceCandidateQueue.length > 0) {
       for (const candidate of peer.iceCandidateQueue) {
@@ -3586,6 +3621,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   console.log('🚀 Initializing app...');
 
   document.addEventListener('click', handleActionClick);
+  document.addEventListener('pointerdown', resumeRemotePlayback, { passive: true });
+  document.addEventListener('keydown', resumeRemotePlayback, { passive: true });
   initPresenterOverlayDrag();
 
   await loadIceServers();
