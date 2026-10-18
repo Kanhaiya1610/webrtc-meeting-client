@@ -1956,15 +1956,26 @@ function getPublishedScreenVideoTrack() {
   return isScreenSharing ? screenStream?.getVideoTracks?.()[0] || null : null;
 }
 
-async function replacePublishedVideoTrack(track) {
+async function replaceCameraTrack(track) {
   for (const [peerId, peer] of Object.entries(peers)) {
-    if (!peer.pc) continue;
-    const sender = peer.pc.getSenders().find(sender => sender.track?.kind === 'video');
+    const sender = peer.cameraTransceiver?.sender || peer.cameraSender;
     if (!sender) continue;
     try {
       await sender.replaceTrack(track || null);
     } catch (error) {
-      console.warn(`Could not replace video track for ${peerId}:`, error.message);
+      console.warn(`Could not replace camera track for ${peerId}:`, error.message);
+    }
+  }
+}
+
+async function replaceScreenTrack(track) {
+  for (const [peerId, peer] of Object.entries(peers)) {
+    const sender = peer.screenTransceiver?.sender;
+    if (!sender) continue;
+    try {
+      await sender.replaceTrack(track || null);
+    } catch (error) {
+      console.warn(`Could not replace screen track for ${peerId}:`, error.message);
     }
   }
 }
@@ -2126,7 +2137,7 @@ async function setBackgroundEffect(effect) {
   if (effect === 'none') {
     backgroundEffect = 'none';
     stopBackgroundPipeline();
-    await replacePublishedVideoTrack(getRawCameraVideoTrack());
+    await replaceCameraTrack(getRawCameraVideoTrack());
     updateLocalVideoPreview();
     updatePresenterOverlay();
     updateBackgroundFilterButton();
@@ -2137,7 +2148,7 @@ async function setBackgroundEffect(effect) {
   try {
     backgroundEffect = effect;
     await ensureBackgroundPipeline();
-    await replacePublishedVideoTrack(backgroundPipeline.track);
+    await replaceCameraTrack(backgroundPipeline.track);
     updateLocalVideoPreview();
     updatePresenterOverlay();
     updateBackgroundFilterButton();
@@ -2181,14 +2192,7 @@ async function toggleScreenShare() {
 
       isScreenSharing = true;
       screenShareOwnerId = clientId;
-      for (const [peerId, peer] of Object.entries(peers)) {
-        if (!peer.pc) continue;
-        const sender = peer.screenTransceiver?.sender;
-        if (sender) {
-          await sender.replaceTrack(screenTrack);
-          console.log(`📤 Published screen track to ${peerId}`);
-        }
-      }
+      await replaceScreenTrack(screenTrack);
       showScreenStage(clientId, screenStream);
       sendSignalingMessage({ type: 'screen_share_state', active: true });
       updateScreenShareButton();
@@ -2212,10 +2216,7 @@ async function stopScreenShare() {
   screenStream = null;
   isScreenSharing = false;
 
-  for (const peer of Object.values(peers)) {
-    const sender = peer.screenTransceiver?.sender;
-    if (sender) await sender.replaceTrack(null).catch(error => console.warn('Could not stop screen track:', error.message));
-  }
+  await replaceScreenTrack(null);
   clearScreenStage(previousOwnerId);
 
   if (backgroundEffect !== 'none' && !backgroundPipeline) {
@@ -2228,7 +2229,7 @@ async function stopScreenShare() {
     }
   }
   const videoTrack = getPublishedCameraVideoTrack();
-  await replacePublishedVideoTrack(videoTrack);
+  await replaceCameraTrack(videoTrack);
   const localVideo = document.querySelector(`#video-${clientId} video`);
   if (localVideo) {
     localVideo.srcObject = backgroundPipeline?.stream || localStream;
@@ -2485,6 +2486,7 @@ function showScreenStage(ownerId, stream) {
   if (!stage || !video) return;
   video.srcObject = stream;
   stage.classList.remove('hidden');
+  requestVideoPlayback(video, false);
   updateScreenStageControls();
 }
 
@@ -2551,6 +2553,17 @@ function initPresenterOverlayDrag() {
   overlay.addEventListener('pointercancel', release);
 }
 
+function requestVideoPlayback(video, isLocal = false) {
+  if (!video || isLocal) return;
+  const play = () => {
+    video.play().catch(error => {
+      console.warn('Remote media playback is waiting for a browser gesture:', error.message);
+    });
+  };
+  if (video.readyState >= HTMLMediaElement.HAVE_METADATA) play();
+  else video.addEventListener('loadedmetadata', play, { once: true });
+}
+
 // ===== VIDEO ELEMENT MANAGEMENT =====
 function addVideoElement(id, stream, isLocal = false, username = 'Participant') {
   const elementId = id || 'local';
@@ -2568,6 +2581,7 @@ function addVideoElement(id, stream, isLocal = false, username = 'Participant') 
     video.playsInline = true;
     video.muted = isLocal;
     video.srcObject = stream;
+    requestVideoPlayback(video, isLocal);
 
     const overlay = document.createElement('div');
     overlay.className = 'video-overlay';
@@ -2602,6 +2616,7 @@ function addVideoElement(id, stream, isLocal = false, username = 'Participant') 
   } else {
     const video = wrapper.querySelector('video');
     video.srcObject = stream;
+    requestVideoPlayback(video, isLocal);
     updateParticipantCameraStatus(elementId, isLocal ? isCameraOff : participantsState.get(elementId)?.isCameraOff, username);
     console.log(`🔄 Updated video stream for ${id}`);
   }
@@ -2696,6 +2711,34 @@ function removeVideoElement(id) {
 }
 
 // ===== WEBRTC PEER CONNECTION =====
+function ensureScreenTransceiver(peer) {
+  if (!peer?.pc || typeof peer.pc.addTransceiver !== 'function') return null;
+  if (!peer.screenTransceiver) {
+    peer.screenTransceiver = peer.pc.addTransceiver('video', { direction: 'sendrecv' });
+  }
+  return peer.screenTransceiver;
+}
+
+function bindNegotiatedScreenTransceiver(peer) {
+  if (!peer?.pc) return null;
+  if (peer.screenTransceiver) return peer.screenTransceiver;
+  const videoTransceivers = peer.pc.getTransceivers().filter(transceiver =>
+    transceiver.receiver?.track?.kind === 'video'
+  );
+  const candidate = videoTransceivers.find(transceiver => transceiver !== peer.cameraTransceiver);
+  if (!candidate) return null;
+  peer.screenTransceiver = candidate;
+  try {
+    candidate.direction = 'sendrecv';
+  } catch (error) {
+    console.warn('Could not set negotiated screen direction:', error.message);
+  }
+  candidate.sender.replaceTrack(getPublishedScreenVideoTrack()).catch(error => {
+    console.warn('Could not attach the current screen track:', error.message);
+  });
+  return candidate;
+}
+
 function createPeerConnection(id, username) {
   if (!isSafeClientId(id)) return null;
   if (peers[id]) {
@@ -2704,68 +2747,77 @@ function createPeerConnection(id, username) {
   }
 
   console.log(`🔧 Creating NEW peer connection for ${id} (${username})`);
-
   const pc = new RTCPeerConnection(pcConfig);
-
-  peers[id] = {
+  const peer = {
     pc,
     username,
+    cameraTransceiver: null,
+    audioTransceiver: null,
+    cameraSender: null,
+    audioSender: null,
     screenTransceiver: null,
+    remoteMediaStream: new MediaStream(),
+    remoteScreenStream: new MediaStream(),
     iceCandidateQueue: [],
     remoteDescriptionSet: false
   };
+  peers[id] = peer;
 
   const videoTrack = getPublishedCameraVideoTrack();
   const audioTrack = localStream?.getAudioTracks?.()[0] || null;
-  const publicationStream = new MediaStream();
-  if (videoTrack) {
-    try {
-      publicationStream.addTrack(videoTrack);
-      pc.addTrack(videoTrack, publicationStream);
-      console.log(`✅ Added video track to peer ${id}`);
-    } catch (e) {
-      console.error(`❌ Failed to add video track to ${id}:`, e);
-    }
-  }
-  if (audioTrack) {
-    try {
-      publicationStream.addTrack(audioTrack);
-      pc.addTrack(audioTrack, publicationStream);
-      console.log(`✅ Added audio track to peer ${id}`);
-    } catch (e) {
-      console.error(`❌ Failed to add audio track to ${id}:`, e);
-    }
-  }
-  // Reserve the screen m-line only after addTrack has assigned the camera
-  // track. Otherwise addTrack reuses this transceiver and remote cameras are
-  // misclassified as screen media.
-  const screenTransceiver = pc.addTransceiver
-    ? pc.addTransceiver('video', { direction: 'sendrecv' })
-    : null;
-  peers[id].screenTransceiver = screenTransceiver;
-  const initialScreenTrack = getPublishedScreenVideoTrack();
-  if (screenTransceiver && initialScreenTrack) {
-    screenTransceiver.sender.replaceTrack(initialScreenTrack).catch(error => {
-      console.warn(`Could not publish current screen to ${id}:`, error.message);
+  if (typeof pc.addTransceiver === 'function') {
+    peer.cameraTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
+    peer.audioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
+    peer.cameraSender = peer.cameraTransceiver.sender;
+    peer.audioSender = peer.audioTransceiver.sender;
+    peer.cameraSender.replaceTrack(videoTrack || null).catch(error => {
+      console.warn(`Could not attach camera to peer ${id}:`, error.message);
     });
+    peer.audioSender.replaceTrack(audioTrack || null).catch(error => {
+      console.warn(`Could not attach microphone to peer ${id}:`, error.message);
+    });
+  } else {
+    const publicationStream = new MediaStream();
+    if (videoTrack) {
+      publicationStream.addTrack(videoTrack);
+      peer.cameraSender = pc.addTrack(videoTrack, publicationStream);
+    }
+    if (audioTrack) {
+      publicationStream.addTrack(audioTrack);
+      peer.audioSender = pc.addTrack(audioTrack, publicationStream);
+    }
   }
 
-  pc.ontrack = (event) => {
+  pc.ontrack = event => {
     console.log(`🎥 Received ${event.track.kind} track from ${id}`);
-    const peer = peers[id];
-    const stream = event.streams?.[0] || new MediaStream([event.track]);
-    const isScreenTrack = peer?.screenTransceiver && (
-      event.transceiver === peer.screenTransceiver || peer.screenTransceiver.receiver?.track === event.track
+    const currentPeer = peers[id];
+    if (!currentPeer) return;
+
+    const isScreenTrack = event.track.kind === 'video' && event.transceiver && (
+      event.transceiver === currentPeer.screenTransceiver ||
+      event.transceiver !== currentPeer.cameraTransceiver
     );
     if (isScreenTrack) {
-      showScreenStage(id, stream);
+      currentPeer.screenTransceiver ||= event.transceiver;
+      if (!currentPeer.remoteScreenStream.getTracks().includes(event.track)) {
+        currentPeer.remoteScreenStream.addTrack(event.track);
+      }
+      const revealScreen = () => {
+        if (event.track.readyState === 'live') showScreenStage(id, currentPeer.remoteScreenStream);
+      };
+      event.track.onunmute = revealScreen;
       event.track.onended = () => clearScreenStage(id);
-    } else {
-      addVideoElement(id, stream, false, username);
+      if (!event.track.muted) revealScreen();
+      return;
     }
+
+    if (!currentPeer.remoteMediaStream.getTracks().includes(event.track)) {
+      currentPeer.remoteMediaStream.addTrack(event.track);
+    }
+    addVideoElement(id, currentPeer.remoteMediaStream, false, username);
   };
 
-  pc.onicecandidate = (event) => {
+  pc.onicecandidate = event => {
     if (event.candidate) {
       sendSignalingMessage({
         type: 'ice_candidate',
@@ -2778,7 +2830,6 @@ function createPeerConnection(id, username) {
   pc.oniceconnectionstatechange = () => {
     const state = pc.iceConnectionState;
     console.log(`🔌 ICE connection state for ${id}: ${state}`);
-
     if (state === 'connected' || state === 'completed') {
       showToast(`Connected to ${username}`, 'success');
     } else if (state === 'failed') {
@@ -2808,8 +2859,13 @@ async function createOffer(targetId, targetUsername) {
   console.log(`📤 Creating offer for ${targetId}`);
 
   const pc = createPeerConnection(targetId, targetUsername);
+  const peer = peers[targetId];
 
   try {
+    const screenTransceiver = ensureScreenTransceiver(peer);
+    if (screenTransceiver) {
+      await screenTransceiver.sender.replaceTrack(getPublishedScreenVideoTrack());
+    }
     const offer = await pc.createOffer({
       offerToReceiveAudio: true,
       offerToReceiveVideo: true
@@ -2837,6 +2893,7 @@ async function handleOffer(fromId, fromUsername, sdp) {
 
   try {
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    bindNegotiatedScreenTransceiver(peer);
     peer.remoteDescriptionSet = true;
 
     if (peer.iceCandidateQueue.length > 0) {
