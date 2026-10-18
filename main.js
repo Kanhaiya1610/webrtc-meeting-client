@@ -2730,36 +2730,10 @@ function removeVideoElement(id) {
 }
 
 // ===== WEBRTC PEER CONNECTION =====
-function ensureScreenTransceiver(peer) {
-  if (!peer?.pc || typeof peer.pc.addTransceiver !== 'function') return null;
-  if (!peer.screenTransceiver) {
-    peer.screenTransceiver = peer.pc.addTransceiver('video', { direction: 'sendrecv' });
-  }
-  return peer.screenTransceiver;
-}
-
-function bindNegotiatedScreenTransceiver(peer) {
-  if (!peer?.pc) return null;
-  if (peer.screenTransceiver) return peer.screenTransceiver;
-  const videoTransceivers = peer.pc.getTransceivers().filter(transceiver =>
-    transceiver.receiver?.track?.kind === 'video'
-  );
-  const candidate = videoTransceivers.find(transceiver => transceiver !== peer.cameraTransceiver);
-  if (!candidate) return null;
-  peer.screenTransceiver = candidate;
-  try {
-    candidate.direction = 'sendrecv';
-  } catch (error) {
-    console.warn('Could not set negotiated screen direction:', error.message);
-  }
-  return candidate;
-}
-
 function attachRemoteTrack(id, username, peer, event) {
-  if (!peer || !event?.track) return;
-  const isScreenTrack = event.track.kind === 'video' &&
-    event.transceiver === peer.screenTransceiver;
-  if (isScreenTrack) {
+  if (!peer || !event?.track || !event.transceiver) return;
+
+  if (event.transceiver === peer.screenTransceiver) {
     if (!peer.remoteScreenStream.getTracks().includes(event.track)) {
       peer.remoteScreenStream.addTrack(event.track);
     }
@@ -2769,6 +2743,18 @@ function attachRemoteTrack(id, username, peer, event) {
     event.track.onunmute = revealScreen;
     event.track.onended = () => clearScreenStage(id);
     if (!event.track.muted) revealScreen();
+    return;
+  }
+
+  if (
+    event.transceiver !== peer.cameraTransceiver &&
+    event.transceiver !== peer.audioTransceiver
+  ) {
+    console.warn('Received a track with an unknown media role:', {
+      remoteId: id,
+      kind: event.track.kind,
+      mid: event.transceiver.mid
+    });
     return;
   }
 
@@ -2800,6 +2786,7 @@ function createPeerConnection(id, username) {
     cameraSender: null,
     audioSender: null,
     screenTransceiver: null,
+    screenSender: null,
     remoteMediaStream: new MediaStream(),
     remoteScreenStream: new MediaStream(),
     pendingRemoteTracks: [],
@@ -2811,14 +2798,21 @@ function createPeerConnection(id, username) {
 
   const videoTrack = getPublishedCameraVideoTrack();
   const audioTrack = localStream?.getAudioTracks?.()[0] || null;
+  const screenTrack = getPublishedScreenVideoTrack();
   if (typeof pc.addTransceiver === 'function') {
+    // Create the three m-lines in the same order for every peer. The order is
+    // the media-role contract used by both sides, so a remote camera can
+    // never be mistaken for the screen track during offer/answer mapping.
     peer.cameraTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
     peer.audioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
+    peer.screenTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
     peer.cameraSender = peer.cameraTransceiver.sender;
     peer.audioSender = peer.audioTransceiver.sender;
+    peer.screenSender = peer.screenTransceiver.sender;
     peer.mediaReady = Promise.all([
       peer.cameraSender.replaceTrack(videoTrack || null),
-      peer.audioSender.replaceTrack(audioTrack || null)
+      peer.audioSender.replaceTrack(audioTrack || null),
+      peer.screenSender.replaceTrack(screenTrack || null)
     ]).catch(error => {
       console.warn(`Could not attach initial media to peer ${id}:`, error.message);
     });
@@ -2891,10 +2885,6 @@ async function createOffer(targetId, targetUsername) {
 
   try {
     await peer.mediaReady;
-    const screenTransceiver = ensureScreenTransceiver(peer);
-    if (screenTransceiver) {
-      await screenTransceiver.sender.replaceTrack(getPublishedScreenVideoTrack());
-    }
     const offer = await pc.createOffer({
       offerToReceiveAudio: true,
       offerToReceiveVideo: true
@@ -2923,10 +2913,6 @@ async function handleOffer(fromId, fromUsername, sdp) {
   try {
     await peer.mediaReady;
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-    const screenTransceiver = bindNegotiatedScreenTransceiver(peer);
-    if (screenTransceiver) {
-      await screenTransceiver.sender.replaceTrack(getPublishedScreenVideoTrack() || null);
-    }
     peer.remoteDescriptionSet = true;
     flushPendingRemoteTracks(fromId, fromUsername, peer);
 
