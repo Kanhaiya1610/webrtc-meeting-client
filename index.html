@@ -4,10 +4,14 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="theme-color" content="#202124" />
+  <meta name="referrer" content="no-referrer" />
+  <meta http-equiv="Permissions-Policy" content="camera=(self), microphone=(self), display-capture=(self)" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; worker-src 'self' blob:; script-src 'self' 'wasm-unsafe-eval' https://accounts.google.com https://cdn.jsdelivr.net; style-src 'self' https://cdnjs.cloudflare.com; style-src-attr 'unsafe-inline'; font-src 'self' https://cdnjs.cloudflare.com; img-src 'self' data: https:; media-src 'self' blob:; frame-src https://accounts.google.com; connect-src 'self' https://accounts.google.com https://just-holly-kanhaiya1610-b072918c.koyeb.app https://webrtc-meeting-server1.onrender.com wss://just-holly-kanhaiya1610-b072918c.koyeb.app wss://webrtc-meeting-server1.onrender.com https://cdn.jsdelivr.net;" />
   <title>Meet Clone – Real-time Video Platform</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
   <link rel="stylesheet" href="style.css" />
   <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js" defer></script>
 </head>
 <body>
   <!-- Landing Page -->
@@ -41,14 +45,14 @@
           </div>
           
           <div class="action-buttons">
-            <button class="btn-primary" onclick="createRoom()">
+            <button class="btn-primary" data-action="create-room">
               <i class="fas fa-video"></i>
               New Meeting
             </button>
             <div class="join-section">
               <label class="sr-only" for="roomIdInput">Meeting code</label>
               <input type="text" id="roomIdInput" placeholder="Enter meeting code" maxlength="8" />
-              <button class="btn-secondary" onclick="joinRoomPrompt()">
+              <button class="btn-secondary" data-action="join-room">
                 <i class="fas fa-sign-in-alt"></i>
                 Join
               </button>
@@ -68,11 +72,11 @@
           <i class="fas fa-video"></i>
           <span id="roomDisplay">Room: Not connected</span>
         </div>
-        <button class="btn-copy" id="copyRoomBtn" onclick="copyRoomId()" title="Copy Meeting Code" aria-label="Copy meeting code">
+        <button class="btn-copy" id="copyRoomBtn" data-action="copy-room" title="Copy Meeting Code" aria-label="Copy meeting code">
           <i class="fas fa-copy"></i>
           Copy code
         </button>
-        <button class="btn-copy btn-copy-link" id="copyLinkBtn" onclick="copyMeetingLink()" title="Copy Meeting Link" aria-label="Copy meeting link">
+        <button class="btn-copy btn-copy-link" id="copyLinkBtn" data-action="copy-link" title="Copy Meeting Link" aria-label="Copy meeting link">
           <i class="fas fa-link"></i>
           Copy link
         </button>
@@ -83,11 +87,11 @@
           <i class="fas fa-circle"></i>
           <span>Connected</span>
         </div>
-        <button type="button" class="participant-count" onclick="toggleSidePanel('participants')" aria-label="Open participants">
+        <button type="button" class="participant-count" data-action="open-participants" aria-label="Open participants">
           <i class="fas fa-users"></i>
           <span id="participantCountBadge">1</span>
         </button>
-        <button class="btn-icon" onclick="signOut()" title="Sign Out" aria-label="Sign out">
+        <button class="btn-icon" data-action="sign-out" title="Sign Out" aria-label="Sign out">
           <i class="fas fa-sign-out-alt"></i>
         </button>
       </div>
@@ -104,10 +108,10 @@
         <div class="captions-header">
           <span>Live Captions</span>
           <div class="captions-header-actions">
-            <button class="btn-icon-small" onclick="showCaptionSettings()" title="Caption Settings" aria-label="Caption settings">
+            <button class="btn-icon-small" data-action="caption-settings" title="Caption Settings" aria-label="Caption settings">
               <i class="fas fa-cog"></i>
             </button>
-            <button class="btn-icon-small" onclick="stopCaptions()" title="Close Captions" aria-label="Close captions">
+            <button class="btn-icon-small" data-action="stop-captions" title="Close Captions" aria-label="Close captions">
               <i class="fas fa-times"></i>
             </button>
           </div>
@@ -127,45 +131,51 @@
     <!-- Controls Bar -->
     <div class="controls-bar" role="toolbar" aria-label="Meeting controls">
       <div class="controls-center">
-        <button class="control-btn" id="toggleMicBtn" onclick="toggleMic()" title="Mute/Unmute" aria-label="Mute or unmute microphone">
+        <button class="control-btn" id="toggleMicBtn" data-action="toggle-mic" title="Mute/Unmute" aria-label="Mute or unmute microphone">
           <i class="fas fa-microphone" id="micIcon"></i>
         </button>
         
-        <button class="control-btn" id="toggleCamBtn" onclick="toggleCamera()" title="Camera On/Off" aria-label="Turn camera on or off">
+        <button class="control-btn" id="toggleCamBtn" data-action="toggle-camera" title="Camera On/Off" aria-label="Turn camera on or off">
           <i class="fas fa-video" id="camIcon"></i>
         </button>
+        <button class="control-btn" id="backgroundFilterBtn" data-action="background-settings" title="Background filters" aria-label="Choose a camera background filter">
+          <i class="fas fa-wand-magic-sparkles"></i>
+        </button>
         
-        <button class="control-btn btn-danger" onclick="leaveMeeting()" title="Leave Meeting" aria-label="Leave meeting">
+        <button class="control-btn btn-danger" data-action="leave-meeting" title="Leave Meeting" aria-label="Leave meeting">
           <i class="fas fa-phone-slash"></i>
         </button>
         
-        <button class="control-btn hidden" id="raiseHandBtn" onclick="toggleRaiseHand()" title="Raise Hand" aria-label="Raise or lower hand">
+        <button class="control-btn hidden" id="raiseHandBtn" data-action="toggle-hand" title="Raise Hand" aria-label="Raise or lower hand">
           <i class="far fa-hand-paper"></i>
         </button>
         
-        <button class="control-btn" id="screenShareBtn" onclick="toggleScreenShare()" title="Share screen" aria-label="Share or stop sharing screen">
+        <button class="control-btn" id="screenShareBtn" data-action="toggle-screen" title="Share screen" aria-label="Share or stop sharing screen">
           <i class="fas fa-desktop"></i>
         </button>
         
-        <button class="control-btn" id="recordBtn" onclick="toggleRecording()" title="Start recording" aria-label="Start or stop recording">
+        <button class="control-btn" id="recordBtn" data-action="toggle-recording" title="Start recording" aria-label="Start or stop recording">
           <i class="fas fa-record-vinyl"></i>
         </button>
         
         <!-- NEW: Captions Button -->
-        <button class="control-btn" id="captionsBtn" onclick="toggleCaptions()" title="Turn on captions" aria-label="Turn live captions on or off">
+        <button class="control-btn" id="captionsBtn" data-action="toggle-captions" title="Turn on captions" aria-label="Turn live captions on or off">
           <i class="far fa-closed-captioning"></i>
         </button>
         
-        <button class="control-btn" onclick="toggleSidePanel('chat')" title="Chat" aria-label="Open chat">
+        <button class="control-btn" data-action="open-chat" title="Chat" aria-label="Open chat">
           <i class="fas fa-comment"></i>
           <span class="notification-badge hidden" id="chatNotificationBadge">0</span>
         </button>
         
-        <button class="control-btn" onclick="toggleSidePanel('participants')" title="Participants" aria-label="Open participants">
+        <button class="control-btn" data-action="open-participants" title="Participants" aria-label="Open participants">
           <i class="fas fa-users"></i>
         </button>
+        <button class="control-btn" data-action="open-notes" title="Take notes" aria-label="Open private meeting notes">
+          <i class="far fa-note-sticky"></i>
+        </button>
         
-        <button class="control-btn hidden" id="endMeetingBtn" onclick="endMeeting()" title="End Meeting for All" aria-label="End meeting for everyone">
+        <button class="control-btn hidden" id="endMeetingBtn" data-action="end-meeting" title="End Meeting for All" aria-label="End meeting for everyone">
           <i class="fas fa-stop-circle"></i>
         </button>
       </div>
@@ -174,17 +184,21 @@
     <!-- Side Panel -->
     <aside id="sidePanel" class="side-panel" role="dialog" aria-label="Meeting details" aria-modal="false">
       <div class="panel-header">
-        <div class="panel-tabs">
-          <button class="tab-btn active" id="participantsTab" onclick="showPanelTab('participants')">
+        <div class="panel-tabs" role="tablist" aria-label="Meeting tools">
+          <button class="tab-btn active" id="participantsTab" data-action="show-participants" role="tab" aria-selected="true" aria-controls="participantsPanel">
             <i class="fas fa-users"></i>
             Participants
           </button>
-          <button class="tab-btn" id="chatTab" onclick="showPanelTab('chat')">
+          <button class="tab-btn" id="chatTab" data-action="show-chat" role="tab" aria-selected="false" aria-controls="chatPanel">
             <i class="fas fa-comment"></i>
             Chat
           </button>
+          <button class="tab-btn" id="notesTab" data-action="show-notes" role="tab" aria-selected="false" aria-controls="notesPanel">
+            <i class="far fa-note-sticky"></i>
+            Notes
+          </button>
         </div>
-        <button class="close-panel" onclick="closeSidePanel()" aria-label="Close meeting details">
+        <button class="close-panel" data-action="close-panel" aria-label="Close meeting details">
           <i class="fas fa-times"></i>
         </button>
       </div>
@@ -193,9 +207,15 @@
       <div id="participantsPanel" class="panel-content">
         <div class="participants-header">
           <h3>In this meeting (<span id="participantCount">1</span>)</h3>
-          <button class="btn-icon hidden" id="muteAllBtn" onclick="muteAll()" title="Mute All">
+          <button class="btn-icon hidden" id="muteAllBtn" data-action="mute-all" title="Mute All">
             <i class="fas fa-microphone-slash"></i>
           </button>
+        </div>
+        <div id="admissionRequestsPanel" class="admission-requests-panel hidden" aria-live="polite">
+          <div class="admission-requests-header">
+            <h4>Requests to join <span id="admissionRequestCount">0</span></h4>
+          </div>
+          <div id="admissionRequestList" class="admission-request-list"></div>
         </div>
         <div id="participantsList" class="participants-list">
           <!-- Participants will be listed here -->
@@ -209,10 +229,24 @@
         </div>
         <div class="chat-input-container">
           <label class="sr-only" for="chatInput">Chat message</label>
-          <textarea id="chatInput" placeholder="Send a message..." rows="1" aria-label="Chat message"></textarea>
-          <button class="send-btn" onclick="sendChatMessage()" aria-label="Send chat message">
+          <textarea id="chatInput" placeholder="Send a message..." rows="1" maxlength="1000" aria-label="Chat message"></textarea>
+          <button class="send-btn" data-action="send-chat" aria-label="Send chat message">
             <i class="fas fa-paper-plane"></i>
           </button>
+        </div>
+      </div>
+
+      <!-- Private Notes Panel -->
+      <div id="notesPanel" class="panel-content notes-panel hidden" role="tabpanel" aria-labelledby="notesTab">
+        <div class="notes-header">
+          <h3>Private meeting notes</h3>
+          <p id="notesPrivacyHint">Only you can see these notes. They are saved locally in this browser.</p>
+        </div>
+        <label class="sr-only" for="notesInput">Private meeting notes</label>
+        <textarea id="notesInput" class="notes-input" maxlength="10000" spellcheck="true" aria-describedby="notesPrivacyHint" placeholder="Capture decisions, action items, and follow-ups…"></textarea>
+        <div class="notes-footer">
+          <span id="notesSaveStatus" role="status" aria-live="polite">Saved locally</span>
+          <button class="btn-secondary notes-clear-btn" type="button" data-action="clear-notes">Clear notes</button>
         </div>
       </div>
     </aside>

@@ -10,7 +10,8 @@ const SERVER_ENDPOINTS = (APP_CONFIG.endpoints || []).map(endpoint => ({
   baseUrl: String(endpoint.baseUrl || '').replace(/\/$/, ''),
   ws: endpoint.ws || `${String(endpoint.baseUrl || '').replace(/^http/, 'ws').replace(/\/$/, '')}/ws`,
   ice: endpoint.ice || `${String(endpoint.baseUrl || '').replace(/\/$/, '')}/ice`,
-  translate: endpoint.translate || `${String(endpoint.baseUrl || '').replace(/\/$/, '')}/translate`
+  translate: endpoint.translate || `${String(endpoint.baseUrl || '').replace(/\/$/, '')}/translate`,
+  transcribe: endpoint.transcribe || `${String(endpoint.baseUrl || '').replace(/\/$/, '')}/captions/transcribe`
 })).filter(endpoint => endpoint.baseUrl && endpoint.ws);
 let currentServerIndex = 0; // Start with the Primary server
 
@@ -54,6 +55,16 @@ let isInMeeting = false;
 let intentionalSocketClose = false;
 let reconnectTimer = null;
 let roomActionPending = null;
+let pendingAdmissionRoomId = null;
+let pendingAdmissionRequestId = null;
+let pendingAdmissionToken = null;
+let pendingAdmissionTimer = null;
+let admissionRequests = new Map();
+let notesRoomId = null;
+let notesStorageKey = null;
+let notesSaveTimer = null;
+let backgroundEffect = 'none';
+let backgroundPipeline = null;
 let googleInitAttempts = 0;
 
 // ===== NEW: CAPTIONS & TRANSLATION STATE =====
@@ -63,8 +74,18 @@ let captionLanguage = 'en-US'; // The language I *speak*
 let myPreferredLanguage = 'en-US'; // The language I *want to read*
 let captionHistory = [];
 const MAX_CAPTION_HISTORY = 50;
+const MAX_CHAT_LENGTH = 1000;
+const MAX_CAPTION_LENGTH = 500;
 let translationCache = new Map(); // Caches interim translations
 let translationTimeouts = new Map(); // Debouncer for interim translations per speaker
+let captionProvider = 'browser';
+let groqRecorder = null;
+let groqUploadQueue = [];
+let groqUploadBusy = false;
+const MAX_GROQ_UPLOAD_QUEUE = 3;
+let groqChunkNumber = 0;
+let browserRecognitionFailures = 0;
+let groqFailureCount = 0;
 
 // Available languages for captions
 const CAPTION_LANGUAGES = {
@@ -107,6 +128,62 @@ function showToast(message, type = 'info') {
     toast.style.animation = 'fadeOut 0.3s ease-out';
     setTimeout(() => toast.remove(), 300);
   }, 3000);
+}
+
+function isSafeClientId(value) {
+  return value === 'local' || (typeof value === 'string' && /^[a-f0-9-]{36}$/i.test(value));
+}
+
+function handleActionClick(event) {
+  const actionElement = event.target.closest('[data-action]');
+  if (!actionElement) return;
+
+  switch (actionElement.dataset.action) {
+    case 'create-room': createRoom(); break;
+    case 'join-room': joinRoomPrompt(); break;
+    case 'copy-room': copyRoomId(); break;
+    case 'copy-link': copyMeetingLink(); break;
+    case 'open-participants': toggleSidePanel('participants'); break;
+    case 'open-chat': toggleSidePanel('chat'); break;
+    case 'open-notes': toggleSidePanel('notes'); break;
+    case 'sign-out': signOut(); break;
+    case 'caption-settings': showCaptionSettings(); break;
+    case 'stop-captions': stopCaptions(); break;
+    case 'toggle-mic': toggleMic(); break;
+    case 'toggle-camera': toggleCamera(); break;
+    case 'background-settings': showBackgroundSettings(); break;
+    case 'select-background':
+      setBackgroundEffect(actionElement.dataset.effect);
+      closeModal(actionElement);
+      break;
+    case 'leave-meeting': leaveMeeting(); break;
+    case 'toggle-hand': toggleRaiseHand(); break;
+    case 'toggle-screen': toggleScreenShare(); break;
+    case 'toggle-recording': toggleRecording(); break;
+    case 'toggle-captions': toggleCaptions(); break;
+    case 'end-meeting': endMeeting(); break;
+    case 'show-participants': showPanelTab('participants'); break;
+    case 'show-chat': showPanelTab('chat'); break;
+    case 'show-notes': showPanelTab('notes'); break;
+    case 'clear-notes': clearMeetingNotes(); break;
+    case 'cancel-admission': cancelAdmissionRequest(); break;
+    case 'admit-request': admitJoinRequest(actionElement.dataset.requestId); break;
+    case 'reject-request': rejectJoinRequest(actionElement.dataset.requestId); break;
+    case 'close-panel': closeSidePanel(); break;
+    case 'mute-all': muteAll(); break;
+    case 'send-chat': sendChatMessage(); break;
+    case 'download-captions': downloadCaptionHistory(); break;
+    case 'close-modal': closeModal(actionElement); break;
+    case 'apply-caption-settings':
+      applyCaptionSettings();
+      closeModal(actionElement);
+      break;
+    case 'send-unmute-request':
+      sendUnmuteRequest();
+      closeModal(actionElement);
+      break;
+    default: break;
+  }
 }
 
 function showLoading(text = 'Connecting...') {
@@ -184,14 +261,16 @@ function handleCredentialResponse(response) {
   const signIn = document.getElementById('gSignInDiv');
   if (signIn) signIn.style.display = 'none';
   if (ws?.readyState === WebSocket.OPEN) authenticateSocket();
+  else initWebSocket();
 }
 
 function renderAuthenticatedUser(user) {
   if (!user || typeof user.name !== 'string' || typeof user.email !== 'string') return;
   googleUser = {
+    sub: typeof user.sub === 'string' ? user.sub.slice(0, 200) : null,
     name: user.name.slice(0, 80),
     email: user.email.slice(0, 320),
-    picture: typeof user.picture === 'string' ? user.picture : null
+    picture: typeof user.picture === 'string' && /^https:\/\//i.test(user.picture) ? user.picture : null
   };
   document.getElementById('authStatus')?.classList.add('hidden');
   const afterAuth = document.getElementById('afterAuth');
@@ -215,6 +294,23 @@ function authenticateSocket() {
   sendSignalingMessage({ type: 'authenticate', credential: googleCredential });
 }
 
+function closeMeetingSocket() {
+  intentionalSocketClose = true;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (ws) {
+    if (ws.readyState === WebSocket.OPEN) sendSignalingMessage({ type: 'logout' });
+    try {
+      ws.close(1000, 'Signed out');
+    } catch (error) {
+      console.warn('Could not close meeting socket:', error.message);
+    }
+    ws = null;
+  }
+}
+
 function signOut() {
   if (isInMeeting) {
     if (!confirm('You are in a meeting. Are you sure you want to sign out?')) {
@@ -223,6 +319,9 @@ function signOut() {
     leaveMeeting(true);
   }
 
+  clearAdmissionState();
+  pendingRoomCode = null;
+  closeMeetingSocket();
   googleCredential = null;
   sessionToken = null;
   googleUser = null;
@@ -247,7 +346,11 @@ async function loadIceServers() {
   for (let offset = 0; offset < SERVER_ENDPOINTS.length; offset += 1) {
     const index = (currentServerIndex + offset) % SERVER_ENDPOINTS.length;
     try {
-      const response = await fetch(SERVER_ENDPOINTS[index].ice, { cache: 'no-store' });
+      const headers = sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {};
+      const response = await fetch(SERVER_ENDPOINTS[index].ice, {
+        cache: 'no-store',
+        headers
+      });
       if (!response.ok) throw new Error(`ICE endpoint returned ${response.status}`);
       const data = await response.json();
       if (!Array.isArray(data.iceServers) || data.iceServers.length === 0) throw new Error('No ICE servers returned');
@@ -321,9 +424,13 @@ async function handleSignalingMessage(data) {
     case 'authenticated':
       sessionToken = data.sessionToken || null;
       renderAuthenticatedUser(data.user);
+      await loadIceServers();
       showToast('Signed in successfully!', 'success');
       if (isInMeeting && roomId && resumeToken) {
         sendSignalingMessage({ type: 'resume_room', roomId, resumeToken });
+      } else if (pendingAdmissionRoomId && !isInMeeting) {
+        roomActionPending = 'prepare_join';
+        sendSignalingMessage({ type: 'prepare_room', action: 'join', roomId: pendingAdmissionRoomId });
       } else if (pendingRoomCode && !isInMeeting) {
         const autoCode = pendingRoomCode;
         pendingRoomCode = null;
@@ -341,7 +448,7 @@ async function handleSignalingMessage(data) {
       if (data.user) renderAuthenticatedUser(data.user);
       if (data.roomId) {
         isAdmin = !!data.isAdmin;
-        adminToken = data.adminToken || adminToken;
+        adminToken = isAdmin && typeof data.adminToken === 'string' ? data.adminToken : null;
       } else if (!isInMeeting) {
         isAdmin = false;
         adminToken = null;
@@ -373,6 +480,7 @@ async function handleSignalingMessage(data) {
       roomId = data.roomId || roomId;
       resumeToken = data.resumeToken || resumeToken;
       if (data.adminClientId) roomAdminClientId = data.adminClientId;
+      clearAdmissionState();
       updateRoomDisplay();
       roomActionPending = null;
       showMeetingRoom();
@@ -458,17 +566,112 @@ async function handleSignalingMessage(data) {
       }
       break;
     }
+
+    case 'recording_state':
+      if (data.clientId !== clientId) {
+        showToast(`${data.username || 'A participant'} ${data.active ? 'started' : 'stopped'} recording`, data.active ? 'info' : 'success');
+      }
+      break;
+
+    case 'room_prepared':
+      if (data.action === 'create') {
+        try {
+          await setupLocalStream();
+          roomActionPending = 'create';
+          sendSignalingMessage({ type: 'create_room' });
+        } catch (error) {
+          roomActionPending = null;
+          hideLoading();
+        }
+      } else if (data.action === 'join' && data.roomId) {
+        pendingAdmissionRoomId = data.roomId;
+        roomActionPending = 'request_join';
+        sendSignalingMessage({ type: 'request_join', roomId: data.roomId });
+      }
+      break;
+
+    case 'join_request_pending':
+      pendingAdmissionRequestId = data.requestId || null;
+      pendingAdmissionRoomId = data.roomId || pendingAdmissionRoomId;
+      showAdmissionWaiting(data.expiresAt);
+      roomActionPending = 'waiting_for_admission';
+      hideLoading();
+      break;
+
+    case 'pending_join_requests':
+      if (isAdmin && data.roomId === roomId) {
+        admissionRequests = new Map((Array.isArray(data.requests) ? data.requests : []).map(request => [request.requestId, request]));
+        renderAdmissionRequests();
+      }
+      break;
+
+    case 'join_request_received':
+      if (isAdmin && data.roomId === roomId && data.requestId) {
+        admissionRequests.set(data.requestId, data);
+        renderAdmissionRequests();
+        showToast(`${data.username || 'Someone'} is waiting to join`, 'info');
+      }
+      break;
+
+    case 'join_request_removed':
+      admissionRequests.delete(data.requestId);
+      renderAdmissionRequests();
+      break;
+
+    case 'join_admitted':
+      clearAdmissionWaiting();
+      pendingAdmissionRequestId = data.requestId || pendingAdmissionRequestId;
+      pendingAdmissionToken = data.admissionToken || null;
+      pendingAdmissionRoomId = data.roomId || pendingAdmissionRoomId;
+      roomActionPending = 'admitted_join';
+      showLoading('Host admitted you. Preparing your camera…');
+      try {
+        await setupLocalStream();
+        sendSignalingMessage({
+          type: 'join_room',
+          roomId: pendingAdmissionRoomId,
+          admissionToken: pendingAdmissionToken
+        });
+      } catch (error) {
+        sendSignalingMessage({ type: 'cancel_join_request', requestId: pendingAdmissionRequestId });
+        clearAdmissionState();
+        hideLoading();
+      }
+      break;
+
+    case 'join_rejected':
+      clearAdmissionState();
+      hideLoading();
+      showToast('The host did not admit you to this meeting.', 'error');
+      break;
+
+    case 'join_request_expired':
+      clearAdmissionState();
+      hideLoading();
+      showToast(data.reason === 'ADMISSION_TIMEOUT' ? 'The admission window expired before you joined.' : 'Your request to join expired.', 'info');
+      break;
+
+    case 'join_request_cancelled':
+      clearAdmissionState();
+      hideLoading();
+      break;
+
+    case 'screen_share_state':
+      if (data.clientId !== clientId) {
+        showToast(`${data.username || 'A participant'} ${data.active ? 'started' : 'stopped'} screen sharing`, 'info');
+      }
+      break;
       
     case 'offer':
-      await handleOffer(data.from || data.fromId, data.fromUsername, data.sdp);
+      if (isSafeClientId(data.from || data.fromId)) await handleOffer(data.from || data.fromId, data.fromUsername, data.sdp);
       break;
       
     case 'answer':
-      await handleAnswer(data.from || data.fromId, data.sdp);
+      if (isSafeClientId(data.from || data.fromId)) await handleAnswer(data.from || data.fromId, data.sdp);
       break;
       
     case 'ice_candidate':
-      await handleIceCandidate(data.from || data.fromId, data.candidate);
+      if (isSafeClientId(data.from || data.fromId)) await handleIceCandidate(data.from || data.fromId, data.candidate);
       break;
       
     case 'force_mute':
@@ -556,9 +759,8 @@ async function handleSignalingMessage(data) {
       
     // NEW: Handle caption messages with translation
     case 'caption':
-      if (captionsEnabled) {
-        // Pass to displayCaption, which now handles translation logic
-        displayCaption(data.fromUsername, data.text, data.isFinal, data.language);
+      if (captionsEnabled && data.fromClientId && data.fromClientId !== clientId) {
+        displayCaption(data.fromUsername, data.text, data.isFinal, data.language, data.fromClientId);
       }
       break;
       
@@ -584,10 +786,20 @@ async function handleSignalingMessage(data) {
       
     case 'error':
       console.error('Server error:', data.message);
+      if (['ADMISSION_REQUIRED', 'ADMISSION_BUSY', 'ROOM_FULL', 'ROOM_NOT_FOUND'].includes(data.code) && !isInMeeting) {
+        clearAdmissionState();
+      }
       if (data.code === 'AUTH_FAILED' || data.code === 'AUTH_REQUIRED') {
+        if (isInMeeting) leaveMeeting(true);
+        closeMeetingSocket();
         googleCredential = null;
         sessionToken = null;
         googleUser = null;
+        resumeToken = null;
+        roomId = null;
+        clientId = null;
+        adminToken = null;
+        isAdmin = false;
         document.getElementById('gSignInDiv')?.style.setProperty('display', 'flex');
         const authStatus = document.getElementById('authStatus');
         if (authStatus) {
@@ -672,13 +884,16 @@ async function translateText(text, sourceLang, targetLang, callback) {
  * Renders the caption text to the DOM.
  * This is the final step, whether translated or not.
  */
-function renderCaption(username, text, isFinal) {
-  const container = document.getElementById('captionsDisplay');
-  if (!container) return;
-  const captionId = `caption-${Array.from(String(username)).map(char => char.codePointAt(0).toString(16)).join('-')}`;
-  let captionElement = document.getElementById(captionId);
+function captionSpeakerKey(username, speakerClientId = null) {
+  return String(speakerClientId || username || 'participant');
+}
 
-  // Create new element if one for this speaker doesn't exist
+function renderCaption(username, text, isFinal, speakerClientId = null) {
+  const container = document.getElementById('captionsDisplay');
+  if (!container || (speakerClientId && speakerClientId === clientId)) return;
+  const speakerKey = captionSpeakerKey(username, speakerClientId);
+  const captionId = `caption-${Array.from(speakerKey).map(char => char.codePointAt(0).toString(16)).join('-')}`;
+  let captionElement = document.getElementById(captionId);
   if (!captionElement) {
     captionElement = document.createElement('div');
     captionElement.id = captionId;
@@ -686,101 +901,80 @@ function renderCaption(username, text, isFinal) {
     container.appendChild(captionElement);
   }
 
-  const isOwnCaption = username === googleUser?.name;
-
-  // Update the content
   captionElement.innerHTML = `
-    <span class="caption-speaker ${isOwnCaption ? 'own' : ''}">${escapeHtml(username)}:</span>
+    <span class="caption-speaker">${escapeHtml(username)}:</span>
     <span class="caption-text ${isFinal ? 'final' : 'interim'}">${escapeHtml(text)}</span>
   `;
 
   if (isFinal) {
-    // Add to history
     captionHistory.push({
       username,
-      text, // Store the final (possibly translated) text
+      speakerClientId,
+      text,
       timestamp: Date.now()
     });
-    
-    // Limit history size
-    if (captionHistory.length > MAX_CAPTION_HISTORY) {
-      captionHistory.shift();
-    }
-    
-    // Remove final caption after a delay
+    if (captionHistory.length > MAX_CAPTION_HISTORY) captionHistory.shift();
     setTimeout(() => {
       if (captionElement && captionElement.querySelector('.caption-text.final')) {
         captionElement.style.opacity = '0';
-        setTimeout(() => {
-          if (captionElement) captionElement.remove();
-        }, 500);
+        setTimeout(() => captionElement?.remove(), 500);
       }
-    }, 3000); // Fade out after 3 seconds
+    }, 3000);
   }
 
-  // Auto-scroll to bottom
   container.scrollTop = container.scrollHeight;
 }
 
-/**
- * Main logic to display captions.
- * Decides if translation is needed and handles interim/final results.
- */
-function displayCaption(username, text, isFinal, sourceLanguage = 'en-US') {
-  const isOwnCaption = username === googleUser?.name;
-  const needsTranslation = !isOwnCaption && sourceLanguage && sourceLanguage !== myPreferredLanguage;
+function displayCaption(username, text, isFinal, sourceLanguage = 'en-US', speakerClientId = null) {
+  if (speakerClientId && speakerClientId === clientId) return;
+  const speakerKey = captionSpeakerKey(username, speakerClientId);
+  const needsTranslation = sourceLanguage && sourceLanguage !== myPreferredLanguage;
 
   if (!needsTranslation) {
-    renderCaption(username, text, isFinal);
+    renderCaption(username, text, isFinal, speakerClientId);
     return;
   }
 
-  // --- Translation is Needed ---
   if (isFinal) {
-    clearTimeout(translationTimeouts.get(username));
-    translationTimeouts.delete(username);
-    translationCache.delete(username);
+    clearTimeout(translationTimeouts.get(speakerKey));
+    translationTimeouts.delete(speakerKey);
+    translationCache.delete(speakerKey);
 
-    // If already in client cache, render instantly
     const cacheKey = `${sourceLanguage}->${myPreferredLanguage}:${text.trim().toLowerCase()}`;
     if (clientTranslationCache.has(cacheKey)) {
-      renderCaption(username, clientTranslationCache.get(cacheKey), true);
+      renderCaption(username, clientTranslationCache.get(cacheKey), true, speakerClientId);
       return;
     }
 
-    renderCaption(username, `${text} (Translating…)`, false); 
-
-    translateText(text, sourceLanguage, myPreferredLanguage, (translatedText) => {
-      renderCaption(username, translatedText, true);
+    renderCaption(username, `${text} (Translating…)`, false, speakerClientId);
+    translateText(text, sourceLanguage, myPreferredLanguage, translatedText => {
+      renderCaption(username, translatedText, true, speakerClientId);
     });
   } else {
-    // Interim text: rapid 350ms debounce
-    translationCache.set(username, text);
-    clearTimeout(translationTimeouts.get(username));
-    renderCaption(username, text, false);
+    translationCache.set(speakerKey, text);
+    clearTimeout(translationTimeouts.get(speakerKey));
+    renderCaption(username, text, false, speakerClientId);
 
     const timeout = setTimeout(() => {
-      const cachedText = translationCache.get(username);
+      const cachedText = translationCache.get(speakerKey);
       if (cachedText) {
-        translateText(cachedText, sourceLanguage, myPreferredLanguage, (translatedText) => {
-          renderCaption(username, translatedText, false);
+        translateText(cachedText, sourceLanguage, myPreferredLanguage, translatedText => {
+          renderCaption(username, translatedText, false, speakerClientId);
         });
-        translationCache.delete(username);
+        translationCache.delete(speakerKey);
       }
-      translationTimeouts.delete(username);
+      translationTimeouts.delete(speakerKey);
     }, 350);
-    translationTimeouts.set(username, timeout);
+    translationTimeouts.set(speakerKey, timeout);
   }
 }
-
 
 function initSpeechRecognition() {
   // Check browser support
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   
   if (!SpeechRecognition) {
-    console.error('Speech recognition not supported');
-    showToast('Captions not supported in this browser', 'error');
+    console.info('Browser speech recognition is unavailable; Groq fallback will be used.');
     return false;
   }
   
@@ -791,10 +985,12 @@ function initSpeechRecognition() {
   recognition.maxAlternatives = 1;
   
   recognition.onstart = () => {
-    console.log('🎤 Speech recognition started');
+    browserRecognitionFailures = 0;
+    console.log('🎤 Browser speech recognition started');
   };
   
   recognition.onresult = (event) => {
+    if (!captionsEnabled || captionProvider !== 'browser') return;
     let interimTranscript = '';
     let finalTranscript = '';
     
@@ -809,19 +1005,18 @@ function initSpeechRecognition() {
     }
     
     if (finalTranscript) {
+      browserRecognitionFailures = 0;
       // Send final caption to all participants
       sendCaption(finalTranscript.trim(), true);
-      // Display my own caption
-      renderCaption(googleUser.name, finalTranscript.trim(), true);
     } else if (interimTranscript) {
+      browserRecognitionFailures = 0;
       // Send interim caption (real-time)
       sendCaption(interimTranscript.trim(), false);
-      // Display my own interim caption
-      renderCaption(googleUser.name, interimTranscript.trim(), false);
     }
   };
   
   recognition.onerror = (event) => {
+    if (!captionsEnabled || captionProvider !== 'browser') return;
     console.error('Speech recognition error:', event.error);
     
     if (event.error === 'no-speech') {
@@ -833,17 +1028,16 @@ function initSpeechRecognition() {
           }
         }, 1000);
       }
-    } else if (event.error === 'not-allowed') {
-      showToast('Microphone permission denied for captions', 'error');
-      captionsEnabled = false;
-      updateCaptionsButton();
+    } else if (['not-allowed', 'service-not-allowed', 'network', 'language-not-supported'].includes(event.error)) {
+      browserRecognitionFailures += 1;
+      if (browserRecognitionFailures >= 1) switchToGroqCaptions(`Browser captions unavailable (${event.error})`);
     }
   };
   
   recognition.onend = () => {
-    console.log('🎤 Speech recognition ended');
+    console.log('🎤 Browser speech recognition ended');
     // Restart if captions still enabled
-    if (captionsEnabled) {
+    if (captionsEnabled && captionProvider === 'browser') {
       setTimeout(() => {
         if (captionsEnabled && recognition) {
           try {
@@ -868,34 +1062,151 @@ function toggleCaptions() {
 }
 
 function startCaptions() {
-  if (!recognition) {
-    if (!initSpeechRecognition()) {
-      return;
-    }
-  }
-  
   if (!localStream || localStream.getAudioTracks().length === 0) {
     showToast('Cannot start captions: microphone not available', 'error');
     return;
   }
+
+  captionsEnabled = true;
+  const container = document.getElementById('captionsContainer');
+  if (container) {
+    container.classList.remove('hidden');
+    container.removeAttribute('aria-hidden');
+  }
+
+  if (!recognition && initSpeechRecognition()) {
+    captionProvider = 'browser';
+  } else if (!recognition) {
+    switchToGroqCaptions('Browser speech recognition is unavailable');
+    return;
+  }
   
+  try {
+    captionProvider = 'browser';
+    recognition.lang = captionLanguage;
+    recognition.start();
+    updateCaptionsButton();
+    showToast(`Captions started with browser recognition (Speaking ${CAPTION_LANGUAGES[captionLanguage]})`, 'success');
+  } catch (err) {
+    console.error('Failed to start captions:', err);
+    switchToGroqCaptions('Browser captions could not start');
+  }
+}
+
+function getGroqTranscriptionEndpoint() {
+  return SERVER_ENDPOINTS[currentServerIndex]?.transcribe || null;
+}
+
+function getSupportedAudioMimeType() {
+  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
+  return candidates.find(type => window.MediaRecorder?.isTypeSupported?.(type)) || '';
+}
+
+function startGroqCaptionCapture() {
+  const endpoint = getGroqTranscriptionEndpoint();
+  const audioTracks = localStream?.getAudioTracks?.() || [];
+  const mimeType = getSupportedAudioMimeType();
+  if (!endpoint || !sessionToken || audioTracks.length === 0 || !window.MediaRecorder || !mimeType) {
+    return false;
+  }
+
+  try {
+    groqRecorder?.stop();
+  } catch (error) {
+    console.warn('Could not stop previous Groq recorder:', error.message);
+  }
+
+  try {
+    groqUploadQueue = [];
+    groqChunkNumber = 0;
+    groqFailureCount = 0;
+    groqRecorder = new MediaRecorder(new MediaStream(audioTracks), { mimeType });
+    groqRecorder.ondataavailable = event => {
+      if (event.data?.size > 0 && captionsEnabled && captionProvider === 'groq') {
+        if (groqUploadQueue.length >= MAX_GROQ_UPLOAD_QUEUE) groqUploadQueue.shift();
+        groqUploadQueue.push({ blob: event.data, chunkNumber: ++groqChunkNumber });
+        flushGroqUploadQueue();
+      }
+    };
+    groqRecorder.onerror = () => switchToBrowserCaptions('Groq audio capture failed');
+    groqRecorder.start(4_000);
+    return true;
+  } catch (error) {
+    console.warn('Could not start Groq audio capture:', error.message);
+    groqRecorder = null;
+    groqUploadQueue = [];
+    return false;
+  }
+}
+
+async function flushGroqUploadQueue() {
+  if (groqUploadBusy || !captionsEnabled || captionProvider !== 'groq') return;
+  const item = groqUploadQueue.shift();
+  if (!item) return;
+  const endpoint = getGroqTranscriptionEndpoint();
+  if (!endpoint || !sessionToken) return;
+
+  groqUploadBusy = true;
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${sessionToken}`,
+        'Content-Type': item.blob.type || 'audio/webm',
+        'X-Caption-Language': captionLanguage,
+        'X-Caption-Chunk': String(item.chunkNumber)
+      },
+      body: item.blob
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || `Groq transcription failed (${response.status})`);
+    groqFailureCount = 0;
+    // The server broadcasts this caption to other participants only.
+
+  } catch (error) {
+    groqFailureCount += 1;
+    console.warn('Groq transcription failed:', error.message);
+    if (groqFailureCount >= 2) switchToBrowserCaptions('Groq captions are unavailable');
+  } finally {
+    groqUploadBusy = false;
+    flushGroqUploadQueue();
+  }
+}
+
+function switchToGroqCaptions(reason) {
+  if (!captionsEnabled || captionProvider === 'groq') return;
+  if (recognition) {
+    try { recognition.stop(); } catch (error) { /* already stopped */ }
+  }
+  captionProvider = 'groq';
+  if (!startGroqCaptionCapture()) {
+    captionsEnabled = false;
+    updateCaptionsButton();
+    showToast('Neither browser captions nor Groq fallback is available.', 'error');
+    return;
+  }
+  updateCaptionsButton();
+  showToast(`${reason}. Switched to Groq captions.`, 'info');
+}
+
+function switchToBrowserCaptions(reason) {
+  if (!captionsEnabled || captionProvider === 'browser') return;
+  try { groqRecorder?.stop(); } catch (error) { /* already stopped */ }
+  groqRecorder = null;
+  groqUploadQueue = [];
+  if (!recognition && !initSpeechRecognition()) {
+    captionsEnabled = false;
+    updateCaptionsButton();
+    showToast('Browser captions are unavailable.', 'error');
+    return;
+  }
+  captionProvider = 'browser';
   try {
     recognition.lang = captionLanguage;
     recognition.start();
-    captionsEnabled = true;
-    updateCaptionsButton();
-    
-    // Show captions container
-    const container = document.getElementById('captionsContainer');
-    if (container) {
-      container.classList.remove('hidden');
-      container.removeAttribute('aria-hidden');
-    }
-    
-    showToast(`Captions started (Speaking ${CAPTION_LANGUAGES[captionLanguage]})`, 'success');
-  } catch (err) {
-    console.error('Failed to start captions:', err);
-    showToast('Failed to start captions', 'error');
+    showToast(`${reason}. Switched to browser captions.`, 'info');
+  } catch (error) {
+    switchToGroqCaptions('Browser captions could not restart');
   }
 }
 
@@ -907,6 +1218,15 @@ function stopCaptions() {
       console.error('Error stopping recognition:', err);
     }
   }
+  try {
+    groqRecorder?.stop();
+  } catch (err) {
+    console.error('Error stopping Groq caption capture:', err);
+  }
+  groqRecorder = null;
+  groqUploadQueue = [];
+  groqUploadBusy = false;
+  captionProvider = 'browser';
   
   captionsEnabled = false;
   translationTimeouts.forEach(timeout => clearTimeout(timeout));
@@ -929,10 +1249,12 @@ function stopCaptions() {
 
 function sendCaption(text, isFinal) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const safeText = String(text || '').trim().slice(0, MAX_CAPTION_LENGTH);
+  if (!safeText) return;
   
   sendSignalingMessage({
     type: 'caption',
-    text: text,
+    text: safeText,
     isFinal: isFinal,
     language: captionLanguage // Send the language I'm speaking
   });
@@ -994,15 +1316,15 @@ function showCaptionSettings() {
       </div>
       
       <div class="settings-group">
-        <button class="btn-secondary" onclick="downloadCaptionHistory()">
+        <button class="btn-secondary" data-action="download-captions">
           <i class="fas fa-download"></i>
           Download Caption History
         </button>
       </div>
       
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="closeModal(this)">Cancel</button>
-        <button class="btn-primary" onclick="applyCaptionSettings(); closeModal(this);">Apply</button>
+        <button class="btn-secondary" data-action="close-modal">Cancel</button>
+        <button class="btn-primary" data-action="apply-caption-settings">Apply</button>
       </div>
     </div>
   `;
@@ -1065,6 +1387,138 @@ function downloadCaptionHistory() {
   showToast('Caption history downloaded', 'success');
 }
 
+function clearAdmissionWaiting() {
+  if (pendingAdmissionTimer) {
+    clearInterval(pendingAdmissionTimer);
+    pendingAdmissionTimer = null;
+  }
+  document.getElementById('admissionWaitingModal')?.remove();
+}
+
+function clearAdmissionState() {
+  clearAdmissionWaiting();
+  pendingAdmissionRequestId = null;
+  pendingAdmissionToken = null;
+  pendingAdmissionRoomId = null;
+}
+
+function showAdmissionWaiting(expiresAt) {
+  clearAdmissionWaiting();
+  const modal = document.createElement('div');
+  modal.id = 'admissionWaitingModal';
+  modal.className = 'modal-overlay';
+  modal.innerHTML = `
+    <div class="modal-content admission-waiting-modal" role="dialog" aria-modal="true" aria-labelledby="admissionWaitingTitle">
+      <h3 id="admissionWaitingTitle">Waiting for host approval</h3>
+      <p>The host has been notified. Keep this window open while you wait.</p>
+      <p id="admissionWaitingCountdown" class="admission-countdown" role="status" aria-live="polite"></p>
+      <div class="modal-actions">
+        <button class="btn-secondary" data-action="cancel-admission">Cancel request</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+
+  const updateCountdown = () => {
+    const remaining = Math.max(0, Number(expiresAt) - Date.now());
+    const seconds = Math.ceil(remaining / 1000);
+    const countdown = document.getElementById('admissionWaitingCountdown');
+    if (countdown) countdown.textContent = seconds > 0 ? `Request expires in ${Math.ceil(seconds / 60)} minute${seconds >= 120 ? 's' : ''}.` : 'Request expired.';
+    if (remaining <= 0) clearAdmissionWaiting();
+  };
+  updateCountdown();
+  pendingAdmissionTimer = setInterval(updateCountdown, 1000);
+}
+
+function cancelAdmissionRequest() {
+  if (pendingAdmissionRequestId) {
+    sendSignalingMessage({ type: 'cancel_join_request', requestId: pendingAdmissionRequestId });
+  }
+  clearAdmissionState();
+  pendingRoomCode = null;
+  roomActionPending = null;
+  hideLoading();
+  showToast('Join request cancelled', 'info');
+}
+
+function admitJoinRequest(requestId) {
+  if (!isAdmin || !requestId) return;
+  sendSignalingMessage({ type: 'admit_join_request', requestId, adminToken });
+}
+
+function rejectJoinRequest(requestId) {
+  if (!isAdmin || !requestId) return;
+  sendSignalingMessage({ type: 'reject_join_request', requestId, adminToken });
+}
+
+function renderAdmissionRequests() {
+  const panel = document.getElementById('admissionRequestsPanel');
+  const list = document.getElementById('admissionRequestList');
+  const count = document.getElementById('admissionRequestCount');
+  if (!panel || !list || !count) return;
+  if (!isAdmin) {
+    panel.classList.add('hidden');
+    list.replaceChildren();
+    count.textContent = '0';
+    return;
+  }
+  panel.classList.remove('hidden');
+  list.replaceChildren();
+  count.textContent = String(admissionRequests.size);
+  if (admissionRequests.size === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'admission-empty';
+    empty.textContent = 'No one is waiting to join.';
+    list.appendChild(empty);
+    return;
+  }
+
+  admissionRequests.forEach(request => {
+    const row = document.createElement('div');
+    row.className = 'admission-request';
+    row.dataset.requestId = request.requestId;
+
+    const info = document.createElement('div');
+    info.className = 'admission-request-info';
+    const avatar = document.createElement('div');
+    avatar.className = 'participant-avatar admission-avatar';
+    avatar.textContent = String(request.username || 'Participant').charAt(0).toUpperCase();
+    if (request.picture && /^https:\/\//i.test(request.picture)) {
+      avatar.style.backgroundImage = `url("${CSS.escape(request.picture)}")`;
+      avatar.classList.add('image-avatar');
+    }
+    const details = document.createElement('div');
+    details.className = 'participant-details';
+    const name = document.createElement('p');
+    name.textContent = String(request.username || 'Participant').slice(0, 80);
+    const expiry = document.createElement('span');
+    expiry.textContent = request.expiresAt ? `Expires ${new Date(request.expiresAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : 'Waiting';
+    details.append(name, expiry);
+    info.append(avatar, details);
+
+    const actions = document.createElement('div');
+    actions.className = 'admission-actions';
+    const admit = document.createElement('button');
+    admit.className = 'btn-admission admit';
+    admit.type = 'button';
+    admit.dataset.action = 'admit-request';
+    admit.dataset.requestId = request.requestId;
+    admit.textContent = 'Admit';
+    admit.setAttribute('aria-label', `Admit ${name.textContent}`);
+    const reject = document.createElement('button');
+    reject.className = 'btn-admission reject';
+    reject.type = 'button';
+    reject.dataset.action = 'reject-request';
+    reject.dataset.requestId = request.requestId;
+    reject.textContent = 'Reject';
+    reject.setAttribute('aria-label', `Reject ${name.textContent}`);
+    actions.append(admit, reject);
+
+    row.append(info, actions);
+    list.appendChild(row);
+  });
+}
+
 // ===== ADMIN UI UPDATES =====
 function updateAdminUI() {
   const endMeetingBtn = document.getElementById('endMeetingBtn');
@@ -1080,6 +1534,7 @@ function updateAdminUI() {
     muteAllBtn?.classList.add('hidden');
     raiseHandBtn?.classList.remove('hidden');
   }
+  renderAdmissionRequests();
 }
 
 // ===== ROOM ACTIONS =====
@@ -1097,9 +1552,8 @@ async function createRoom() {
   showLoading('Creating room...');
 
   try {
-    await setupLocalStream();
-    roomActionPending = 'create';
-    sendSignalingMessage({ type: 'create_room' });
+    roomActionPending = 'prepare_create';
+    sendSignalingMessage({ type: 'prepare_room', action: 'create' });
   } catch (err) {
     console.error('Failed to create room:', err);
     showToast('Failed to create room', 'error');
@@ -1109,8 +1563,8 @@ async function createRoom() {
 
 async function joinRoomById(targetRoomId) {
   const id = String(targetRoomId || '').trim().toUpperCase();
-  if (!id) {
-    showToast('Please enter a room code', 'error');
+  if (!/^[A-Z0-9]{6}$/.test(id)) {
+    showToast('Enter a valid six-character meeting code', 'error');
     return;
   }
   
@@ -1130,11 +1584,11 @@ async function joinRoomById(targetRoomId) {
   }
   
   showLoading(`Joining room ${id}...`);
-  
+
   try {
-    await setupLocalStream();
-    roomActionPending = 'join';
-    sendSignalingMessage({ type: 'join_room', roomId: id });
+    pendingRoomCode = id;
+    roomActionPending = 'prepare_join';
+    sendSignalingMessage({ type: 'prepare_room', action: 'join', roomId: id });
   } catch (err) {
     console.error('Failed to join room:', err);
     showToast('Failed to join room: ' + (err.message || 'Stream error'), 'error');
@@ -1197,7 +1651,8 @@ function copyMeetingLink() {
   }
   
   const url = new URL(window.location.href);
-  url.searchParams.set('room-code', roomId);
+  url.search = '';
+  url.hash = `room-code=${encodeURIComponent(roomId)}`;
   const inviteUrl = url.toString();
   
   const finishCopy = () => {
@@ -1237,13 +1692,13 @@ function checkUrlRoomCode() {
       if (hash.includes('=')) {
         const hashParams = new URLSearchParams(hash);
         hashVal = hashParams.get('room-code') || hashParams.get('room_code') || hashParams.get('room');
-      } else if (/^[A-Za-z0-9]{4,10}$/.test(hash)) {
+      } else if (/^[A-Za-z0-9]{6}$/.test(hash)) {
         hashVal = hash;
       }
     }
 
     const roomCode = (code || hashVal || '').trim().toUpperCase();
-    if (roomCode) {
+    if (/^[A-Z0-9]{6}$/.test(roomCode)) {
       pendingRoomCode = roomCode;
       const input = document.getElementById('roomIdInput');
       if (input) input.value = roomCode;
@@ -1260,7 +1715,11 @@ function checkUrlRoomCode() {
         authStatus.textContent = `Sign in with Google to enter meeting ${roomCode}`;
       }
       
-      console.log(`🔗 Detected meeting invitation room code in URL: ${roomCode}`);
+      // Remove the invitation code from browser history after reading it.
+      const cleanUrl = new URL(window.location.href);
+      ['room-code', 'room_code', 'room', 'roomId'].forEach(key => cleanUrl.searchParams.delete(key));
+      cleanUrl.hash = '';
+      window.history.replaceState({}, document.title, cleanUrl.toString());
       
       if (googleUser && ws && ws.readyState === WebSocket.OPEN && !isInMeeting) {
         const toJoin = pendingRoomCode;
@@ -1328,12 +1787,258 @@ async function setupLocalStream() {
     addVideoElement(clientId || 'local', localStream, true, googleUser.name);
     updateMicButton();
     updateCameraButton();
+    updateBackgroundFilterButton();
     updateParticipantCameraStatus(clientId || 'local', isCameraOff, googleUser.name);
   } catch (err) {
     console.error('❌ getUserMedia failed:', err);
     showToast('Could not access camera/microphone', 'error');
     throw err;
   }
+}
+
+const BACKGROUND_EFFECTS = {
+  none: { label: 'None', color: null },
+  blur: { label: 'Blur', color: null },
+  white: { label: 'Soft white', color: '#f3f6fb' },
+  black: { label: 'Black', color: '#050505' },
+  peach: { label: 'Soft peach', color: '#f4d5c5' },
+  lavender: { label: 'Soft lavender', color: '#ddd7f5' },
+  mint: { label: 'Soft mint', color: '#cfe8dd' },
+  sky: { label: 'Soft sky', color: '#cfe2f4' },
+  sand: { label: 'Soft sand', color: '#e9ddc5' }
+};
+
+function showBackgroundSettings() {
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  modal.innerHTML = `
+    <div class="modal-content background-modal" role="dialog" aria-modal="true" aria-labelledby="backgroundSettingsTitle">
+      <h3 id="backgroundSettingsTitle">Background filters</h3>
+      <p>Choose a prebuilt camera background. Your microphone and screen share are not affected.</p>
+      <div class="background-options" role="group" aria-label="Background filter choices">
+        ${Object.entries(BACKGROUND_EFFECTS).map(([effect, option]) => `
+          <button type="button" class="background-option ${backgroundEffect === effect ? 'selected' : ''}" data-action="select-background" data-effect="${effect}" aria-pressed="${backgroundEffect === effect}">
+            <span class="background-swatch background-${effect}" aria-hidden="true"></span>
+            <span>${option.label}</span>
+          </button>
+        `).join('')}
+      </div>
+      <div class="modal-actions">
+        <button class="btn-secondary" data-action="close-modal">Close</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+}
+
+function getRawCameraVideoTrack() {
+  return localStream?.getVideoTracks?.()[0] || null;
+}
+
+function getPublishedCameraVideoTrack() {
+  if (isScreenSharing) return screenStream?.getVideoTracks?.()[0] || null;
+  return (backgroundEffect !== 'none' && backgroundPipeline?.track) || getRawCameraVideoTrack();
+}
+
+async function replacePublishedVideoTrack(track) {
+  for (const [peerId, peer] of Object.entries(peers)) {
+    if (!peer.pc) continue;
+    const sender = peer.pc.getSenders().find(sender => sender.track?.kind === 'video');
+    if (!sender) continue;
+    try {
+      await sender.replaceTrack(track || null);
+    } catch (error) {
+      console.warn(`Could not replace video track for ${peerId}:`, error.message);
+    }
+  }
+}
+
+function updateLocalVideoPreview() {
+  if (isScreenSharing) return;
+  const localVideo = document.querySelector(`#video-${clientId} video`) || document.querySelector('#video-local video');
+  if (!localVideo) return;
+  if (backgroundEffect !== 'none' && backgroundPipeline?.stream) {
+    localVideo.srcObject = backgroundPipeline.stream;
+  } else if (localStream) {
+    localVideo.srcObject = localStream;
+  }
+  localVideo.style.transform = 'scaleX(-1)';
+}
+
+function drawBackgroundResults(results) {
+  const pipeline = backgroundPipeline;
+  if (!pipeline || !results?.image || !results.segmentationMask) return;
+  const width = results.image.videoWidth || results.image.width || pipeline.width;
+  const height = results.image.videoHeight || results.image.height || pipeline.height;
+  if (width !== pipeline.width || height !== pipeline.height) {
+    pipeline.width = width;
+    pipeline.height = height;
+    pipeline.canvas.width = width;
+    pipeline.canvas.height = height;
+    pipeline.backgroundCanvas.width = width;
+    pipeline.backgroundCanvas.height = height;
+    pipeline.personCanvas.width = width;
+    pipeline.personCanvas.height = height;
+  }
+
+  const backgroundContext = pipeline.backgroundCanvas.getContext('2d');
+  const personContext = pipeline.personCanvas.getContext('2d');
+  const outputContext = pipeline.canvas.getContext('2d');
+  backgroundContext.clearRect(0, 0, width, height);
+  if (backgroundEffect === 'blur') {
+    backgroundContext.save();
+    backgroundContext.filter = 'blur(18px)';
+    backgroundContext.drawImage(results.image, -18, -18, width + 36, height + 36);
+    backgroundContext.restore();
+  } else {
+    backgroundContext.fillStyle = BACKGROUND_EFFECTS[backgroundEffect]?.color || '#111';
+    backgroundContext.fillRect(0, 0, width, height);
+  }
+
+  personContext.clearRect(0, 0, width, height);
+  personContext.globalCompositeOperation = 'source-over';
+  personContext.drawImage(results.image, 0, 0, width, height);
+  personContext.globalCompositeOperation = 'destination-in';
+  personContext.drawImage(results.segmentationMask, 0, 0, width, height);
+  personContext.globalCompositeOperation = 'source-over';
+
+  outputContext.clearRect(0, 0, width, height);
+  outputContext.drawImage(pipeline.backgroundCanvas, 0, 0, width, height);
+  outputContext.drawImage(pipeline.personCanvas, 0, 0, width, height);
+}
+
+function stopBackgroundPipeline() {
+  const pipeline = backgroundPipeline;
+  if (!pipeline) return;
+  pipeline.stopped = true;
+  if (pipeline.frameId) cancelAnimationFrame(pipeline.frameId);
+  try { pipeline.segmentation?.close?.(); } catch (error) { console.warn('Could not close background model:', error.message); }
+  pipeline.sourceVideo.pause();
+  pipeline.sourceVideo.srcObject = null;
+  pipeline.processedStream?.getTracks?.().forEach(track => track.stop());
+  pipeline.sourceVideo.remove();
+  backgroundPipeline = null;
+}
+
+async function ensureBackgroundPipeline() {
+  if (backgroundPipeline) return backgroundPipeline;
+  const sourceTrack = getRawCameraVideoTrack();
+  if (!sourceTrack || !window.SelfieSegmentation || !HTMLCanvasElement.prototype.captureStream) {
+    throw new Error('Background processing is not supported in this browser');
+  }
+
+  const sourceVideo = document.createElement('video');
+  sourceVideo.muted = true;
+  sourceVideo.autoplay = true;
+  sourceVideo.playsInline = true;
+  sourceVideo.setAttribute('aria-hidden', 'true');
+  sourceVideo.style.cssText = 'position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;left:-10px;top:-10px;';
+  sourceVideo.srcObject = new MediaStream([sourceTrack]);
+  document.body.appendChild(sourceVideo);
+  await sourceVideo.play();
+  await new Promise(resolve => {
+    if (sourceVideo.videoWidth) return resolve();
+    sourceVideo.addEventListener('loadedmetadata', resolve, { once: true });
+  });
+
+  const width = sourceVideo.videoWidth || sourceTrack.getSettings?.().width || 640;
+  const height = sourceVideo.videoHeight || sourceTrack.getSettings?.().height || 360;
+  const canvas = document.createElement('canvas');
+  const backgroundCanvas = document.createElement('canvas');
+  const personCanvas = document.createElement('canvas');
+  [canvas, backgroundCanvas, personCanvas].forEach(item => {
+    item.width = width;
+    item.height = height;
+  });
+  const segmentation = new SelfieSegmentation({
+    locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`
+  });
+  segmentation.setOptions({ modelSelection: 1 });
+
+  const processedStream = canvas.captureStream(24);
+  const pipeline = {
+    sourceVideo,
+    canvas,
+    backgroundCanvas,
+    personCanvas,
+    segmentation,
+    processedStream,
+    track: processedStream.getVideoTracks()[0],
+    stream: processedStream,
+    width,
+    height,
+    frameId: null,
+    processing: false,
+    stopped: false
+  };
+  backgroundPipeline = pipeline;
+  segmentation.onResults(drawBackgroundResults);
+
+  const processFrame = async () => {
+    if (pipeline.stopped) return;
+    if (!pipeline.processing && !isCameraOff && sourceVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      pipeline.processing = true;
+      try {
+        await segmentation.send({ image: sourceVideo });
+      } catch (error) {
+        console.warn('Background processing frame failed:', error.message);
+      } finally {
+        pipeline.processing = false;
+      }
+    }
+    pipeline.frameId = requestAnimationFrame(processFrame);
+  };
+  pipeline.frameId = requestAnimationFrame(processFrame);
+  return pipeline;
+}
+
+async function setBackgroundEffect(effect) {
+  if (!BACKGROUND_EFFECTS[effect]) return;
+  if (effect === backgroundEffect && (effect === 'none' || backgroundPipeline)) return;
+  if (!localStream?.getVideoTracks?.().length) {
+    showToast('Turn on your camera before choosing a background filter.', 'info');
+    return;
+  }
+  if (isScreenSharing) {
+    backgroundEffect = effect;
+    if (effect === 'none') stopBackgroundPipeline();
+    updateBackgroundFilterButton();
+    showToast(`${BACKGROUND_EFFECTS[effect].label} will apply when screen sharing stops.`, 'info');
+    return;
+  }
+
+  if (effect === 'none') {
+    backgroundEffect = 'none';
+    stopBackgroundPipeline();
+    await replacePublishedVideoTrack(getRawCameraVideoTrack());
+    updateLocalVideoPreview();
+    updateBackgroundFilterButton();
+    showToast('Background filter removed', 'info');
+    return;
+  }
+
+  try {
+    backgroundEffect = effect;
+    await ensureBackgroundPipeline();
+    await replacePublishedVideoTrack(backgroundPipeline.track);
+    updateLocalVideoPreview();
+    updateBackgroundFilterButton();
+    showToast(`${BACKGROUND_EFFECTS[effect].label} background applied`, 'success');
+  } catch (error) {
+    console.error('Background filter failed:', error);
+    backgroundEffect = 'none';
+    stopBackgroundPipeline();
+    updateBackgroundFilterButton();
+    showToast('Background filters are not available in this browser.', 'error');
+  }
+}
+
+function updateBackgroundFilterButton() {
+  const button = document.getElementById('backgroundFilterBtn');
+  if (!button) return;
+  button.classList.toggle('active', backgroundEffect !== 'none');
+  button.title = backgroundEffect === 'none' ? 'Background filters' : `Background: ${BACKGROUND_EFFECTS[backgroundEffect].label}`;
+  button.setAttribute('aria-label', button.title);
 }
 
 // ===== SCREEN SHARING =====
@@ -1373,6 +2078,7 @@ async function toggleScreenShare() {
       }
       
       isScreenSharing = true;
+      sendSignalingMessage({ type: 'screen_share_state', active: true });
       updateScreenShareButton();
       showToast('Screen sharing started', 'success');
       
@@ -1385,35 +2091,32 @@ async function toggleScreenShare() {
   }
 }
 
-function stopScreenShare() {
+async function stopScreenShare() {
   if (!screenStream) return;
-  
+
   console.log('⏹️ Stopping screen share...');
-  
   screenStream.getTracks().forEach(track => track.stop());
-  
-  if (localStream) {
-    const videoTrack = localStream.getVideoTracks()[0];
-    
-    for (const [peerId, peer] of Object.entries(peers)) {
-      if (!peer.pc) continue;
-      
-      const sender = peer.pc.getSenders().find(s => s.track?.kind === 'video');
-      if (sender && videoTrack) {
-        sender.replaceTrack(videoTrack);
-        console.log(`📤 Restored camera track for ${peerId}`);
-      }
-    }
-    
-    const localVideo = document.querySelector(`#video-${clientId} video`);
-    if (localVideo) {
-      localVideo.srcObject = localStream;
-      localVideo.style.transform = 'scaleX(-1)';
-    }
-  }
-  
   screenStream = null;
   isScreenSharing = false;
+
+  if (backgroundEffect !== 'none' && !backgroundPipeline) {
+    try {
+      await ensureBackgroundPipeline();
+    } catch (error) {
+      backgroundEffect = 'none';
+      updateBackgroundFilterButton();
+      showToast('Background filter could not be restored after screen sharing.', 'error');
+    }
+  }
+  const videoTrack = getPublishedCameraVideoTrack();
+  await replacePublishedVideoTrack(videoTrack);
+  const localVideo = document.querySelector(`#video-${clientId} video`);
+  if (localVideo) {
+    localVideo.srcObject = backgroundPipeline?.stream || localStream;
+    localVideo.style.transform = 'scaleX(-1)';
+  }
+
+  sendSignalingMessage({ type: 'screen_share_state', active: false });
   updateScreenShareButton();
   showToast('Screen sharing stopped', 'info');
 }
@@ -1554,6 +2257,7 @@ async function startRecording() {
     isRecording = true;
     mediaRecorder.start(1000);
     captureFrame();
+    sendSignalingMessage({ type: 'recording_state', active: true });
     updateRecordingButton();
     showToast('Recording started', 'success');
     
@@ -1572,6 +2276,7 @@ function stopRecording() {
   console.log('⏹️ Stopping recording...');
   mediaRecorder.stop();
   isRecording = false;
+  sendSignalingMessage({ type: 'recording_state', active: false });
   updateRecordingButton();
   showToast('Recording stopped', 'info');
 }
@@ -1596,6 +2301,7 @@ function updateRecordingButton() {
 // ===== VIDEO ELEMENT MANAGEMENT =====
 function addVideoElement(id, stream, isLocal = false, username = 'Participant') {
   const elementId = id || 'local';
+  if (!isSafeClientId(elementId)) return;
   let wrapper = document.getElementById(`video-${id}`);
   if (!wrapper) wrapper = document.getElementById(`video-${elementId}`);
   
@@ -1726,6 +2432,7 @@ function updateVideoGrid() {
 }
 
 function removeVideoElement(id) {
+  if (!isSafeClientId(id)) return;
   const wrapper = document.getElementById(`video-${id}`);
   if (wrapper) {
     wrapper.remove();
@@ -1736,6 +2443,7 @@ function removeVideoElement(id) {
 
 // ===== WEBRTC PEER CONNECTION =====
 function createPeerConnection(id, username) {
+  if (!isSafeClientId(id)) return null;
   if (peers[id]) {
     console.log(`♻️ Reusing existing peer connection for ${id}`);
     return peers[id].pc;
@@ -1752,16 +2460,25 @@ function createPeerConnection(id, username) {
     remoteDescriptionSet: false
   };
   
-  const streamToSend = isScreenSharing ? screenStream : localStream;
-  
-  if (streamToSend) {
-    for (const track of streamToSend.getTracks()) {
-      try {
-        pc.addTrack(track, streamToSend);
-        console.log(`✅ Added ${track.kind} track to peer ${id}`);
-      } catch (e) {
-        console.error(`❌ Failed to add ${track.kind} track to ${id}:`, e);
-      }
+  const videoTrack = getPublishedCameraVideoTrack();
+  const audioTrack = localStream?.getAudioTracks?.()[0] || null;
+  const publicationStream = new MediaStream();
+  if (videoTrack) {
+    try {
+      publicationStream.addTrack(videoTrack);
+      pc.addTrack(videoTrack, publicationStream);
+      console.log(`✅ Added video track to peer ${id}`);
+    } catch (e) {
+      console.error(`❌ Failed to add video track to ${id}:`, e);
+    }
+  }
+  if (audioTrack) {
+    try {
+      publicationStream.addTrack(audioTrack);
+      pc.addTrack(audioTrack, publicationStream);
+      console.log(`✅ Added audio track to peer ${id}`);
+    } catch (e) {
+      console.error(`❌ Failed to add audio track to ${id}:`, e);
     }
   }
   
@@ -1812,6 +2529,7 @@ function createPeerConnection(id, username) {
 }
 
 async function createOffer(targetId, targetUsername) {
+  if (!isSafeClientId(targetId)) return;
   console.log(`📤 Creating offer for ${targetId}`);
   
   const pc = createPeerConnection(targetId, targetUsername);
@@ -1950,6 +2668,7 @@ function toggleCamera() {
   localStream.getVideoTracks().forEach(track => {
     track.enabled = !isCameraOff;
   });
+  if (backgroundPipeline?.track) backgroundPipeline.track.enabled = !isCameraOff;
 
   sendSignalingMessage({ type: 'media_state', isMuted, isCameraOff, handRaised });
   updateCameraButton();
@@ -1997,6 +2716,7 @@ function updateRaiseHandButton() {
 }
 
 function updateParticipantHandStatus(participantId, raised) {
+  if (!isSafeClientId(participantId)) return;
   const handIndicator = document.getElementById(`hand-${participantId}`);
   if (handIndicator) {
     if (raised) {
@@ -2015,8 +2735,8 @@ function showRequestUnmuteModal() {
       <h3>Request to Unmute</h3>
       <p>The host has muted you. Would you like to request permission to unmute?</p>
       <div class="modal-actions">
-        <button class="btn-secondary" onclick="closeModal(this)">Cancel</button>
-        <button class="btn-primary" onclick="sendUnmuteRequest(); closeModal(this);">Send Request</button>
+        <button class="btn-secondary" data-action="close-modal">Cancel</button>
+        <button class="btn-primary" data-action="send-unmute-request">Send Request</button>
       </div>
     </div>
   `;
@@ -2067,7 +2787,7 @@ function closeModal(btn) {
 // Participant management functions
 function addParticipantToList(id, username, handRaised = false, isAdminMuted = false) {
   const list = document.getElementById('participantsList');
-  if (!list || !id) return;
+  if (!list || !isSafeClientId(id)) return;
   username = String(username || 'Participant').slice(0, 80);
   let item = document.getElementById(`participant-${id}`);
   if (!item) {
@@ -2107,6 +2827,7 @@ function addParticipantToList(id, username, handRaised = false, isAdminMuted = f
 }
 
 function removeParticipantFromList(id) {
+  if (!isSafeClientId(id)) return;
   const item = document.getElementById(`participant-${id}`);
   if (item) {
     item.remove();
@@ -2123,6 +2844,7 @@ function updateParticipantCount() {
 }
 
 function updateParticipantMuteStatus(participantId, isAdminMuted) {
+  if (!isSafeClientId(participantId)) return;
   const listItem = document.getElementById(`participant-${participantId}`);
   const mutedIndicator = document.getElementById(`muted-${participantId}`);
   mutedIndicator?.classList.toggle('hidden', !isAdminMuted);
@@ -2227,7 +2949,7 @@ function endMeeting() {
 
 function sendChatMessage() {
   const input = document.getElementById('chatInput');
-  const message = input.value.trim();
+  const message = input.value.trim().slice(0, MAX_CHAT_LENGTH);
   if (!message) return;
   sendSignalingMessage({ type: 'chat_message', message });
   input.value = '';
@@ -2245,6 +2967,7 @@ function displayChatMessage(username, message, timestamp, isLocal) {
     <div class="message-time">${escapeHtml(timestamp || formatTime(new Date()))}</div>
   `;
   container.appendChild(msgDiv);
+  while (container.children.length > 200) container.firstElementChild.remove();
   container.scrollTop = container.scrollHeight;
   const panel = document.getElementById('sidePanel');
   const chatPanel = document.getElementById('chatPanel');
@@ -2276,6 +2999,92 @@ function formatTime(date) {
   return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 }
 
+function getNotesStorageKey() {
+  const accountKey = googleUser?.sub || googleUser?.email;
+  if (!accountKey || !roomId) return null;
+  return `meet-clone:meeting-notes:v1:${encodeURIComponent(accountKey)}:${roomId}`;
+}
+
+function setNotesSaveStatus(message, isError = false) {
+  const status = document.getElementById('notesSaveStatus');
+  if (status) {
+    status.textContent = message;
+    status.classList.toggle('error', isError);
+  }
+}
+
+function loadMeetingNotes() {
+  if (notesRoomId === roomId && notesStorageKey) return;
+  notesRoomId = roomId;
+  notesStorageKey = getNotesStorageKey();
+  const input = document.getElementById('notesInput');
+  if (!input) return;
+  input.value = '';
+  if (!notesStorageKey) {
+    setNotesSaveStatus('Notes are available after sign-in', true);
+    return;
+  }
+  try {
+    const raw = localStorage.getItem(notesStorageKey);
+    const record = raw ? JSON.parse(raw) : null;
+    input.value = record?.version === 1 && record.roomId === roomId && typeof record.text === 'string'
+      ? record.text.slice(0, 10000)
+      : '';
+    setNotesSaveStatus('Saved locally');
+  } catch (error) {
+    console.warn('Could not load meeting notes:', error.message);
+    setNotesSaveStatus('Unable to load local notes', true);
+  }
+}
+
+function saveMeetingNotes() {
+  if (!notesStorageKey || notesRoomId !== roomId) return;
+  const input = document.getElementById('notesInput');
+  if (!input) return;
+  try {
+    localStorage.setItem(notesStorageKey, JSON.stringify({
+      version: 1,
+      roomId,
+      text: input.value.slice(0, 10000),
+      updatedAt: Date.now()
+    }));
+    setNotesSaveStatus('Saved locally');
+  } catch (error) {
+    console.warn('Could not save meeting notes:', error.message);
+    setNotesSaveStatus('Unable to save locally', true);
+  }
+}
+
+function scheduleNotesSave() {
+  setNotesSaveStatus('Saving…');
+  clearTimeout(notesSaveTimer);
+  notesSaveTimer = setTimeout(() => {
+    notesSaveTimer = null;
+    saveMeetingNotes();
+  }, 400);
+}
+
+function flushMeetingNotes() {
+  clearTimeout(notesSaveTimer);
+  notesSaveTimer = null;
+  saveMeetingNotes();
+}
+
+function clearMeetingNotes() {
+  const input = document.getElementById('notesInput');
+  if (input) input.value = '';
+  clearTimeout(notesSaveTimer);
+  notesSaveTimer = null;
+  if (notesStorageKey) {
+    try {
+      localStorage.removeItem(notesStorageKey);
+      setNotesSaveStatus('Notes cleared');
+    } catch (error) {
+      setNotesSaveStatus('Unable to clear local notes', true);
+    }
+  }
+}
+
 function toggleSidePanel(tab) {
   const panel = document.getElementById('sidePanel');
   const isOpen = panel.classList.contains('open');
@@ -2292,6 +3101,9 @@ function toggleSidePanel(tab) {
     unreadMessages = 0;
     updateChatBadge();
   }
+  if (tab === 'notes') {
+    setTimeout(() => document.getElementById('notesInput')?.focus(), 0);
+  }
 }
 
 function closeSidePanel() {
@@ -2301,8 +3113,16 @@ function closeSidePanel() {
 function showPanelTab(tab) {
   document.getElementById('participantsTab').classList.toggle('active', tab === 'participants');
   document.getElementById('chatTab').classList.toggle('active', tab === 'chat');
+  document.getElementById('notesTab').classList.toggle('active', tab === 'notes');
+  document.getElementById('participantsTab').setAttribute('aria-selected', String(tab === 'participants'));
+  document.getElementById('chatTab').setAttribute('aria-selected', String(tab === 'chat'));
+  document.getElementById('notesTab').setAttribute('aria-selected', String(tab === 'notes'));
   document.getElementById('participantsPanel').classList.toggle('hidden', tab !== 'participants');
   document.getElementById('chatPanel').classList.toggle('hidden', tab !== 'chat');
+  document.getElementById('notesPanel').classList.toggle('hidden', tab !== 'notes');
+  if (tab === 'notes') {
+    setTimeout(() => document.getElementById('notesInput')?.focus(), 0);
+  }
   if (tab === 'chat') {
     unreadMessages = 0;
     updateChatBadge();
@@ -2315,6 +3135,7 @@ function showMeetingRoom() {
   document.getElementById('landingPage').classList.add('hidden');
   document.getElementById('meetingRoom').classList.remove('hidden');
   isInMeeting = true;
+  loadMeetingNotes();
   if (clientId && googleUser) {
     addParticipantToList(clientId, googleUser.name, false, false);
   }
@@ -2325,9 +3146,11 @@ function showLandingPage() {
   document.getElementById('meetingRoom').classList.add('hidden');
   document.getElementById('landingPage').classList.remove('hidden');
   isInMeeting = false;
+  closeSidePanel();
 }
 
 function removePeer(id) {
+  if (!isSafeClientId(id)) return;
   console.log(`🗑️ Removing peer: ${id}`);
   if (peers[id]) {
     try {
@@ -2345,13 +3168,17 @@ function leaveMeeting(force = false) {
   if (!force && !confirm('Leave the meeting?')) return false;
   console.log('🚪 Leaving meeting...');
 
-  if (ws?.readyState === WebSocket.OPEN && roomId) {
-    sendSignalingMessage({ type: 'leave_room' });
-  }
-  
   if (isRecording) stopRecording();
   if (isScreenSharing) stopScreenShare();
   if (captionsEnabled) stopCaptions();
+  flushMeetingNotes();
+  if (pendingAdmissionRequestId) sendSignalingMessage({ type: 'cancel_join_request', requestId: pendingAdmissionRequestId });
+  clearAdmissionState();
+  admissionRequests.clear();
+
+  if (ws?.readyState === WebSocket.OPEN && roomId) {
+    sendSignalingMessage({ type: 'leave_room' });
+  }
   
   Object.keys(peers).forEach(id => {
     try {
@@ -2362,6 +3189,9 @@ function leaveMeeting(force = false) {
   });
   peers = {};
   
+  stopBackgroundPipeline();
+  backgroundEffect = 'none';
+  updateBackgroundFilterButton();
   if (localStream) {
     localStream.getTracks().forEach(track => {
       try {
@@ -2384,6 +3214,8 @@ function leaveMeeting(force = false) {
   
   clientId = null;
   roomId = null;
+  notesRoomId = null;
+  notesStorageKey = null;
   resumeToken = null;
   isAdmin = false;
   adminToken = null;
@@ -2414,6 +3246,8 @@ function sendSignalingMessage(message) {
 // ===== INITIALIZATION =====
 document.addEventListener('DOMContentLoaded', async () => {
   console.log('🚀 Initializing app...');
+
+  document.addEventListener('click', handleActionClick);
   
   await loadIceServers();
   
@@ -2438,6 +3272,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
   
+  const notesInput = document.getElementById('notesInput');
+  notesInput?.addEventListener('input', scheduleNotesSave);
+
   const chatInput = document.getElementById('chatInput');
   if (chatInput) {
     chatInput.addEventListener('input', function() {
@@ -2465,7 +3302,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
   
+  window.addEventListener('pagehide', flushMeetingNotes);
   window.addEventListener('beforeunload', (e) => {
+    flushMeetingNotes();
     if (isInMeeting) {
       e.preventDefault();
       e.returnValue = '';
