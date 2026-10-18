@@ -48,6 +48,7 @@ let recordedChunks = [];
 let isRecording = false;
 let recordingFrameId = null;
 let peers = {};
+let pendingIceCandidates = new Map();
 let participantsState = new Map();
 let pcConfig = {
   iceServers: [],
@@ -2730,10 +2731,31 @@ function removeVideoElement(id) {
 }
 
 // ===== WEBRTC PEER CONNECTION =====
+function getRemoteTrackRole(peer, transceiver) {
+  if (!peer || !transceiver) return null;
+
+  const mid = transceiver.mid;
+  const roleByMid = [
+    ['camera', peer.cameraTransceiver],
+    ['audio', peer.audioTransceiver],
+    ['screen', peer.screenTransceiver]
+  ];
+  if (mid !== null && mid !== undefined) {
+    const role = roleByMid.find(([, candidate]) => candidate?.mid === mid);
+    if (role) return role[0];
+  }
+
+  // Keep identity as a fallback for browsers that do not expose a mid on the
+  // ontrack transceiver yet.
+  const roleByIdentity = roleByMid.find(([, candidate]) => candidate === transceiver);
+  return roleByIdentity?.[0] || null;
+}
+
 function attachRemoteTrack(id, username, peer, event) {
   if (!peer || !event?.track || !event.transceiver) return;
 
-  if (event.transceiver === peer.screenTransceiver) {
+  const role = getRemoteTrackRole(peer, event.transceiver);
+  if (role === 'screen') {
     if (!peer.remoteScreenStream.getTracks().includes(event.track)) {
       peer.remoteScreenStream.addTrack(event.track);
     }
@@ -2746,14 +2768,17 @@ function attachRemoteTrack(id, username, peer, event) {
     return;
   }
 
-  if (
-    event.transceiver !== peer.cameraTransceiver &&
-    event.transceiver !== peer.audioTransceiver
-  ) {
+  if (role !== 'camera' && role !== 'audio') {
     console.warn('Received a track with an unknown media role:', {
       remoteId: id,
       kind: event.track.kind,
-      mid: event.transceiver.mid
+      mid: event.transceiver.mid,
+      transceivers: peer.pc.getTransceivers().map(transceiver => ({
+        mid: transceiver.mid,
+        kind: transceiver.receiver?.track?.kind,
+        direction: transceiver.direction,
+        currentDirection: transceiver.currentDirection
+      }))
     });
     return;
   }
@@ -2795,6 +2820,12 @@ function createPeerConnection(id, username) {
     remoteDescriptionSet: false
   };
   peers[id] = peer;
+  const earlyCandidates = pendingIceCandidates.get(id);
+  if (earlyCandidates?.length) {
+    peer.iceCandidateQueue.push(...earlyCandidates);
+    pendingIceCandidates.delete(id);
+    console.log(`📦 Queued ${earlyCandidates.length} early ICE candidate(s) for ${id}`);
+  }
 
   const videoTrack = getPublishedCameraVideoTrack();
   const audioTrack = localStream?.getAudioTracks?.()[0] || null;
@@ -2962,7 +2993,13 @@ async function handleAnswer(fromId, sdp) {
 
 async function handleIceCandidate(fromId, candidate) {
   const peer = peers[fromId];
-  if (!peer) return;
+  if (!peer) {
+    const queued = pendingIceCandidates.get(fromId) || [];
+    queued.push(candidate);
+    pendingIceCandidates.set(fromId, queued);
+    console.log(`📦 Queued ICE candidate until peer ${fromId} exists`);
+    return;
+  }
 
   try {
     if (peer.remoteDescriptionSet) {
@@ -3505,6 +3542,7 @@ function showLandingPage() {
 function removePeer(id) {
   if (!isSafeClientId(id)) return;
   console.log(`🗑️ Removing peer: ${id}`);
+  pendingIceCandidates.delete(id);
   if (peers[id]) {
     try {
       peers[id].pc.close();
@@ -3543,6 +3581,7 @@ function leaveMeeting(force = false) {
     }
   });
   peers = {};
+  pendingIceCandidates.clear();
 
   stopBackgroundPipeline();
   backgroundEffect = 'none';
