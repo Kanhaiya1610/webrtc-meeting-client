@@ -36,6 +36,12 @@ let isAdminMuted = false;
 let isCameraOff = false;
 let handRaised = false;
 let isScreenSharing = false;
+let screenShareOwnerId = null;
+let screenStageStream = null;
+let screenPinned = true;
+let presenterOverlayVisible = true;
+let presenterOverlayPosition = { left: null, top: null, right: 16, bottom: 16 };
+let presenterDrag = null;
 let mediaRecorder = null;
 let recordedChunks = [];
 let isRecording = false;
@@ -86,6 +92,10 @@ const MAX_GROQ_UPLOAD_QUEUE = 3;
 let groqChunkNumber = 0;
 let browserRecognitionFailures = 0;
 let groqFailureCount = 0;
+let groqCaptureSessionId = null;
+let browserCaptionId = null;
+let summaryState = 'not_requested';
+let summaryId = null;
 
 // Available languages for captions
 const CAPTION_LANGUAGES = {
@@ -159,9 +169,12 @@ function handleActionClick(event) {
     case 'leave-meeting': leaveMeeting(); break;
     case 'toggle-hand': toggleRaiseHand(); break;
     case 'toggle-screen': toggleScreenShare(); break;
+    case 'toggle-screen-pin': toggleScreenPin(); break;
+    case 'toggle-presenter-overlay': togglePresenterOverlay(); break;
     case 'toggle-recording': toggleRecording(); break;
     case 'toggle-captions': toggleCaptions(); break;
     case 'end-meeting': endMeeting(); break;
+    case 'request-summary': requestMeetingSummary(); break;
     case 'show-participants': showPanelTab('participants'); break;
     case 'show-chat': showPanelTab('chat'); break;
     case 'show-notes': showPanelTab('notes'); break;
@@ -466,6 +479,8 @@ async function handleSignalingMessage(data) {
       roomId = data.roomId;
       roomAdminClientId = clientId;
       isAdmin = true;
+      summaryState = 'not_requested';
+      summaryId = null;
       resumeToken = data.resumeToken || resumeToken;
       updateRoomDisplay();
       showToast(`Room created: ${roomId}`, 'success');
@@ -480,6 +495,7 @@ async function handleSignalingMessage(data) {
       roomId = data.roomId || roomId;
       resumeToken = data.resumeToken || resumeToken;
       if (data.adminClientId) roomAdminClientId = data.adminClientId;
+      if (data.summaryState) summaryState = data.summaryState;
       clearAdmissionState();
       updateRoomDisplay();
       roomActionPending = null;
@@ -491,6 +507,8 @@ async function handleSignalingMessage(data) {
       
     case 'room_state':
       if (data.adminClientId) roomAdminClientId = data.adminClientId;
+      if (data.summaryState) summaryState = data.summaryState;
+      updateSummaryButton();
       participantsState.clear();
       for (const p of Array.isArray(data.participants) ? data.participants : []) {
         if (p.clientId !== clientId) {
@@ -657,8 +675,11 @@ async function handleSignalingMessage(data) {
       break;
 
     case 'screen_share_state':
-      if (data.clientId !== clientId) {
-        showToast(`${data.username || 'A participant'} ${data.active ? 'started' : 'stopped'} screen sharing`, 'info');
+      if (data.active) {
+        screenShareOwnerId = data.clientId || null;
+        showToast(`${data.username || 'A participant'} started screen sharing`, 'info');
+      } else if (!data.clientId || data.clientId === screenShareOwnerId) {
+        clearScreenStage(data.clientId);
       }
       break;
       
@@ -754,9 +775,24 @@ async function handleSignalingMessage(data) {
       break;
       
     case 'new_chat_message':
-      displayChatMessage(data.fromUsername, data.message, data.timestamp, data.fromClientId === clientId);
+      displayChatMessage(data.fromUsername, data.message, data.timestamp, data.fromClientId === clientId, data.messageKind);
       break;
       
+    case 'summary_status':
+      summaryState = data.state || summaryState;
+      summaryId = data.summaryId || summaryId;
+      updateSummaryButton();
+      if (data.state === 'generating') showToast('Generating the meeting summary…', 'info');
+      if (data.state === 'published') {
+        roomActionPending = null;
+        showToast('Meeting summary shared in chat by Meet Clone.', 'success');
+      }
+      if (data.state === 'failed') {
+        roomActionPending = null;
+        showToast('Meeting summary could not be generated.', 'error');
+      }
+      break;
+
     // NEW: Handle caption messages with translation
     case 'caption':
       if (captionsEnabled && data.fromClientId && data.fromClientId !== clientId) {
@@ -786,6 +822,11 @@ async function handleSignalingMessage(data) {
       
     case 'error':
       console.error('Server error:', data.message);
+      if (['SUMMARY_NO_TRANSCRIPT', 'SUMMARY_NOT_CONFIGURED'].includes(data.code) || (data.code === 'UNAUTHORIZED' && roomActionPending === 'summary')) {
+        summaryState = 'not_requested';
+        roomActionPending = null;
+        updateSummaryButton();
+      }
       if (['ADMISSION_REQUIRED', 'ADMISSION_BUSY', 'ROOM_FULL', 'ROOM_NOT_FOUND'].includes(data.code) && !isInMeeting) {
         clearAdmissionState();
       }
@@ -1006,12 +1047,13 @@ function initSpeechRecognition() {
     
     if (finalTranscript) {
       browserRecognitionFailures = 0;
-      // Send final caption to all participants
-      sendCaption(finalTranscript.trim(), true);
+      browserCaptionId ||= createClientToken();
+      sendCaption(finalTranscript.trim(), true, browserCaptionId);
+      browserCaptionId = null;
     } else if (interimTranscript) {
       browserRecognitionFailures = 0;
-      // Send interim caption (real-time)
-      sendCaption(interimTranscript.trim(), false);
+      browserCaptionId ||= createClientToken();
+      sendCaption(interimTranscript.trim(), false, browserCaptionId);
     }
   };
   
@@ -1120,6 +1162,7 @@ function startGroqCaptionCapture() {
     groqUploadQueue = [];
     groqChunkNumber = 0;
     groqFailureCount = 0;
+    groqCaptureSessionId = createClientToken();
     groqRecorder = new MediaRecorder(new MediaStream(audioTracks), { mimeType });
     groqRecorder.ondataavailable = event => {
       if (event.data?.size > 0 && captionsEnabled && captionProvider === 'groq') {
@@ -1154,6 +1197,7 @@ async function flushGroqUploadQueue() {
         Authorization: `Bearer ${sessionToken}`,
         'Content-Type': item.blob.type || 'audio/webm',
         'X-Caption-Language': captionLanguage,
+        'X-Caption-Session': groqCaptureSessionId || createClientToken(),
         'X-Caption-Chunk': String(item.chunkNumber)
       },
       body: item.blob
@@ -1226,6 +1270,8 @@ function stopCaptions() {
   groqRecorder = null;
   groqUploadQueue = [];
   groqUploadBusy = false;
+  groqCaptureSessionId = null;
+  browserCaptionId = null;
   captionProvider = 'browser';
   
   captionsEnabled = false;
@@ -1247,16 +1293,21 @@ function stopCaptions() {
   showToast('Captions stopped', 'info');
 }
 
-function sendCaption(text, isFinal) {
+function createClientToken() {
+  return window.crypto?.randomUUID?.() || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function sendCaption(text, isFinal, captionId = null) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const safeText = String(text || '').trim().slice(0, MAX_CAPTION_LENGTH);
   if (!safeText) return;
   
   sendSignalingMessage({
     type: 'caption',
+    captionId: captionId || undefined,
     text: safeText,
     isFinal: isFinal,
-    language: captionLanguage // Send the language I'm speaking
+    language: captionLanguage
   });
 }
 
@@ -1524,17 +1575,43 @@ function updateAdminUI() {
   const endMeetingBtn = document.getElementById('endMeetingBtn');
   const muteAllBtn = document.getElementById('muteAllBtn');
   const raiseHandBtn = document.getElementById('raiseHandBtn');
+  const summaryBtn = document.getElementById('summaryBtn');
   
   if (isAdmin) {
     endMeetingBtn?.classList.remove('hidden');
     muteAllBtn?.classList.remove('hidden');
     raiseHandBtn?.classList.add('hidden');
+    summaryBtn?.classList.remove('hidden');
   } else {
     endMeetingBtn?.classList.add('hidden');
     muteAllBtn?.classList.add('hidden');
     raiseHandBtn?.classList.remove('hidden');
+    summaryBtn?.classList.add('hidden');
   }
+  updateSummaryButton();
   renderAdmissionRequests();
+}
+
+function updateSummaryButton() {
+  const button = document.getElementById('summaryBtn');
+  if (!button) return;
+  const done = summaryState === 'published' || summaryState === 'failed';
+  button.disabled = !isAdmin || summaryState === 'generating' || done;
+  button.classList.toggle('active', summaryState === 'generating');
+  button.title = summaryState === 'generating'
+    ? 'Generating meeting summary…'
+    : done
+      ? 'Meeting summary already requested'
+      : 'Get meeting summary';
+  button.setAttribute('aria-label', button.title);
+}
+
+function requestMeetingSummary() {
+  if (!isAdmin || !roomId || !adminToken || summaryState !== 'not_requested') return;
+  sendSignalingMessage({ type: 'request_meeting_summary', adminToken });
+  roomActionPending = 'summary';
+  summaryState = 'generating';
+  updateSummaryButton();
 }
 
 // ===== ROOM ACTIONS =====
@@ -1836,8 +1913,11 @@ function getRawCameraVideoTrack() {
 }
 
 function getPublishedCameraVideoTrack() {
-  if (isScreenSharing) return screenStream?.getVideoTracks?.()[0] || null;
   return (backgroundEffect !== 'none' && backgroundPipeline?.track) || getRawCameraVideoTrack();
+}
+
+function getPublishedScreenVideoTrack() {
+  return isScreenSharing ? screenStream?.getVideoTracks?.()[0] || null : null;
 }
 
 async function replacePublishedVideoTrack(track) {
@@ -2012,6 +2092,7 @@ async function setBackgroundEffect(effect) {
     stopBackgroundPipeline();
     await replacePublishedVideoTrack(getRawCameraVideoTrack());
     updateLocalVideoPreview();
+    updatePresenterOverlay();
     updateBackgroundFilterButton();
     showToast('Background filter removed', 'info');
     return;
@@ -2022,6 +2103,7 @@ async function setBackgroundEffect(effect) {
     await ensureBackgroundPipeline();
     await replacePublishedVideoTrack(backgroundPipeline.track);
     updateLocalVideoPreview();
+    updatePresenterOverlay();
     updateBackgroundFilterButton();
     showToast(`${BACKGROUND_EFFECTS[effect].label} background applied`, 'success');
   } catch (error) {
@@ -2061,23 +2143,17 @@ async function toggleScreenShare() {
         stopScreenShare();
       };
       
+      isScreenSharing = true;
+      screenShareOwnerId = clientId;
       for (const [peerId, peer] of Object.entries(peers)) {
         if (!peer.pc) continue;
-        
-        const sender = peer.pc.getSenders().find(s => s.track?.kind === 'video');
+        const sender = peer.screenTransceiver?.sender;
         if (sender) {
           await sender.replaceTrack(screenTrack);
-          console.log(`📤 Replaced video track with screen for ${peerId}`);
+          console.log(`📤 Published screen track to ${peerId}`);
         }
       }
-      
-      const localVideo = document.querySelector(`#video-${clientId} video`);
-      if (localVideo) {
-        localVideo.srcObject = screenStream;
-        localVideo.style.transform = 'none';
-      }
-      
-      isScreenSharing = true;
+      showScreenStage(clientId, screenStream);
       sendSignalingMessage({ type: 'screen_share_state', active: true });
       updateScreenShareButton();
       showToast('Screen sharing started', 'success');
@@ -2095,9 +2171,16 @@ async function stopScreenShare() {
   if (!screenStream) return;
 
   console.log('⏹️ Stopping screen share...');
+  const previousOwnerId = screenShareOwnerId;
   screenStream.getTracks().forEach(track => track.stop());
   screenStream = null;
   isScreenSharing = false;
+
+  for (const peer of Object.values(peers)) {
+    const sender = peer.screenTransceiver?.sender;
+    if (sender) await sender.replaceTrack(null).catch(error => console.warn('Could not stop screen track:', error.message));
+  }
+  clearScreenStage(previousOwnerId);
 
   if (backgroundEffect !== 'none' && !backgroundPipeline) {
     try {
@@ -2298,6 +2381,140 @@ function updateRecordingButton() {
   }
 }
 
+function getScreenStageElement() {
+  return document.getElementById('screenStage');
+}
+
+function getParticipantVideoStream(participantId) {
+  if (participantId === clientId) {
+    return backgroundEffect !== 'none' && backgroundPipeline?.stream ? backgroundPipeline.stream : localStream;
+  }
+  return document.querySelector(`#video-${participantId} video`)?.srcObject || null;
+}
+
+function updatePresenterOverlay() {
+  const overlay = document.getElementById('presenterOverlay');
+  const video = document.getElementById('presenterOverlayVideo');
+  if (!overlay || !video) return;
+  const visible = presenterOverlayVisible && Boolean(screenShareOwnerId) && Boolean(screenStageStream);
+  overlay.classList.toggle('hidden', !visible);
+  if (visible) {
+    const stream = getParticipantVideoStream(screenShareOwnerId);
+    if (stream && video.srcObject !== stream) video.srcObject = stream;
+  } else {
+    video.srcObject = null;
+  }
+  if (presenterOverlayPosition.left !== null) {
+    overlay.style.left = `${presenterOverlayPosition.left}px`;
+    overlay.style.top = `${presenterOverlayPosition.top}px`;
+    overlay.style.right = 'auto';
+    overlay.style.bottom = 'auto';
+  } else {
+    overlay.style.left = 'auto';
+    overlay.style.top = 'auto';
+    overlay.style.right = `${presenterOverlayPosition.right}px`;
+    overlay.style.bottom = `${presenterOverlayPosition.bottom}px`;
+  }
+}
+
+function updateScreenStageControls() {
+  const stage = getScreenStageElement();
+  const pinButton = document.getElementById('screenPinBtn');
+  const overlayButton = document.getElementById('presenterOverlayBtn');
+  const label = document.getElementById('screenStageLabel');
+  if (!stage || !pinButton || !overlayButton) return;
+  stage.classList.toggle('screen-pinned', screenPinned);
+  pinButton.setAttribute('aria-pressed', String(screenPinned));
+  pinButton.title = screenPinned ? 'Unpin screen' : 'Pin screen full view';
+  pinButton.setAttribute('aria-label', pinButton.title);
+  pinButton.querySelector('i')?.classList.toggle('fa-thumbtack', screenPinned);
+  pinButton.querySelector('i')?.classList.toggle('fa-up-right-and-down-left-from-center', !screenPinned);
+  overlayButton.setAttribute('aria-pressed', String(presenterOverlayVisible));
+  overlayButton.title = presenterOverlayVisible ? 'Hide presenter camera' : 'Show presenter camera';
+  overlayButton.setAttribute('aria-label', overlayButton.title);
+  overlayButton.querySelector('i')?.classList.toggle('fa-user', presenterOverlayVisible);
+  overlayButton.querySelector('i')?.classList.toggle('fa-user-slash', !presenterOverlayVisible);
+  if (label) label.textContent = screenShareOwnerId === clientId ? 'You are sharing your screen' : 'Screen sharing';
+  document.getElementById('videoGrid')?.classList.toggle('screen-focused', screenPinned && Boolean(screenStageStream));
+  updatePresenterOverlay();
+}
+
+function showScreenStage(ownerId, stream) {
+  if (!stream) return;
+  screenShareOwnerId = ownerId || screenShareOwnerId;
+  screenStageStream = stream;
+  screenPinned = true;
+  const stage = getScreenStageElement();
+  const video = document.getElementById('screenStageVideo');
+  if (!stage || !video) return;
+  video.srcObject = stream;
+  stage.classList.remove('hidden');
+  updateScreenStageControls();
+}
+
+function clearScreenStage(ownerId = null) {
+  if (ownerId && screenShareOwnerId && ownerId !== screenShareOwnerId) return;
+  screenShareOwnerId = null;
+  screenStageStream = null;
+  const stage = getScreenStageElement();
+  const video = document.getElementById('screenStageVideo');
+  const presenterVideo = document.getElementById('presenterOverlayVideo');
+  stage?.classList.add('hidden');
+  if (video) video.srcObject = null;
+  if (presenterVideo) presenterVideo.srcObject = null;
+  document.getElementById('videoGrid')?.classList.remove('screen-focused');
+}
+
+function toggleScreenPin() {
+  if (!screenStageStream) return;
+  screenPinned = !screenPinned;
+  updateScreenStageControls();
+}
+
+function togglePresenterOverlay() {
+  if (!screenStageStream) return;
+  presenterOverlayVisible = !presenterOverlayVisible;
+  updateScreenStageControls();
+}
+
+function clampPresenterOverlay() {
+  const stage = getScreenStageElement();
+  const overlay = document.getElementById('presenterOverlay');
+  if (!stage || !overlay || presenterOverlayPosition.left === null) return;
+  const stageRect = stage.getBoundingClientRect();
+  const overlayRect = overlay.getBoundingClientRect();
+  presenterOverlayPosition.left = Math.max(0, Math.min(presenterOverlayPosition.left, stageRect.width - overlayRect.width));
+  presenterOverlayPosition.top = Math.max(0, Math.min(presenterOverlayPosition.top, stageRect.height - overlayRect.height));
+  updatePresenterOverlay();
+}
+
+function initPresenterOverlayDrag() {
+  const overlay = document.getElementById('presenterOverlay');
+  if (!overlay) return;
+  overlay.addEventListener('pointerdown', event => {
+    if (event.target.closest('button')) return;
+    const rect = overlay.getBoundingClientRect();
+    presenterDrag = { pointerId: event.pointerId, offsetX: event.clientX - rect.left, offsetY: event.clientY - rect.top };
+    overlay.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+  });
+  overlay.addEventListener('pointermove', event => {
+    if (!presenterDrag || presenterDrag.pointerId !== event.pointerId) return;
+    const stage = getScreenStageElement();
+    if (!stage) return;
+    const stageRect = stage.getBoundingClientRect();
+    const overlayRect = overlay.getBoundingClientRect();
+    presenterOverlayPosition.left = Math.max(0, Math.min(event.clientX - stageRect.left - presenterDrag.offsetX, stageRect.width - overlayRect.width));
+    presenterOverlayPosition.top = Math.max(0, Math.min(event.clientY - stageRect.top - presenterDrag.offsetY, stageRect.height - overlayRect.height));
+    updatePresenterOverlay();
+  });
+  const release = event => {
+    if (presenterDrag?.pointerId === event.pointerId) presenterDrag = null;
+  };
+  overlay.addEventListener('pointerup', release);
+  overlay.addEventListener('pointercancel', release);
+}
+
 // ===== VIDEO ELEMENT MANAGEMENT =====
 function addVideoElement(id, stream, isLocal = false, username = 'Participant') {
   const elementId = id || 'local';
@@ -2354,6 +2571,7 @@ function addVideoElement(id, stream, isLocal = false, username = 'Participant') 
   }
   
   updateVideoGrid();
+  if (screenShareOwnerId === elementId) updatePresenterOverlay();
 }
 
 function updateParticipantCameraStatus(participantId, isOff, username = 'Participant') {
@@ -2453,9 +2671,13 @@ function createPeerConnection(id, username) {
   
   const pc = new RTCPeerConnection(pcConfig);
   
+  const screenTransceiver = pc.addTransceiver
+    ? pc.addTransceiver('video', { direction: 'sendrecv' })
+    : null;
   peers[id] = { 
     pc, 
     username,
+    screenTransceiver,
     iceCandidateQueue: [],
     remoteDescriptionSet: false
   };
@@ -2481,12 +2703,25 @@ function createPeerConnection(id, username) {
       console.error(`❌ Failed to add audio track to ${id}:`, e);
     }
   }
+  const initialScreenTrack = getPublishedScreenVideoTrack();
+  if (screenTransceiver && initialScreenTrack) {
+    screenTransceiver.sender.replaceTrack(initialScreenTrack).catch(error => {
+      console.warn(`Could not publish current screen to ${id}:`, error.message);
+    });
+  }
   
   pc.ontrack = (event) => {
     console.log(`🎥 Received ${event.track.kind} track from ${id}`);
-    
-    if (event.streams && event.streams[0]) {
-      addVideoElement(id, event.streams[0], false, username);
+    const peer = peers[id];
+    const stream = event.streams?.[0] || new MediaStream([event.track]);
+    const isScreenTrack = peer?.screenTransceiver && (
+      event.transceiver === peer.screenTransceiver || peer.screenTransceiver.receiver?.track === event.track
+    );
+    if (isScreenTrack) {
+      showScreenStage(id, stream);
+      event.track.onended = () => clearScreenStage(id);
+    } else {
+      addVideoElement(id, stream, false, username);
     }
   };
   
@@ -2956,11 +3191,11 @@ function sendChatMessage() {
   input.style.height = 'auto';
 }
 
-function displayChatMessage(username, message, timestamp, isLocal) {
+function displayChatMessage(username, message, timestamp, isLocal, messageKind = null) {
   const container = document.getElementById('chatMessages');
   if (!container) return;
   const msgDiv = document.createElement('div');
-  msgDiv.className = `chat-message ${isLocal ? 'local' : 'remote'}`;
+  msgDiv.className = `chat-message ${isLocal ? 'local' : 'remote'}${messageKind === 'meeting_summary' ? ' meeting-summary-message' : ''}`;
   msgDiv.innerHTML = `
     <div class="message-sender">${isLocal ? 'You' : escapeHtml(username)}</div>
     <div class="message-bubble">${escapeHtml(message)}</div>
@@ -3161,6 +3396,7 @@ function removePeer(id) {
     delete peers[id];
   }
   removeVideoElement(id);
+  if (screenShareOwnerId === id) clearScreenStage(id);
   removeParticipantFromList(id);
 }
 
@@ -3170,6 +3406,7 @@ function leaveMeeting(force = false) {
 
   if (isRecording) stopRecording();
   if (isScreenSharing) stopScreenShare();
+  clearScreenStage();
   if (captionsEnabled) stopCaptions();
   flushMeetingNotes();
   if (pendingAdmissionRequestId) sendSignalingMessage({ type: 'cancel_join_request', requestId: pendingAdmissionRequestId });
@@ -3225,6 +3462,10 @@ function leaveMeeting(force = false) {
   handRaised = false;
   unreadMessages = 0;
   isInMeeting = false;
+  summaryState = 'not_requested';
+  summaryId = null;
+  screenShareOwnerId = null;
+  screenStageStream = null;
   participantsState.clear();
   
   showLandingPage();
@@ -3248,6 +3489,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   console.log('🚀 Initializing app...');
 
   document.addEventListener('click', handleActionClick);
+  initPresenterOverlayDrag();
   
   await loadIceServers();
   
@@ -3316,13 +3558,21 @@ document.addEventListener('DOMContentLoaded', async () => {
   checkUrlRoomCode();
 
   // Automatic layout adaptation on window resize and mobile device rotation
-  window.addEventListener('resize', updateVideoGrid);
+  window.addEventListener('resize', () => {
+    updateVideoGrid();
+    clampPresenterOverlay();
+    updateScreenStageControls();
+  });
   window.addEventListener('orientationchange', () => {
     setTimeout(updateVideoGrid, 100);
   });
   if (window.screen && window.screen.orientation) {
     window.screen.orientation.addEventListener('change', () => {
-      setTimeout(updateVideoGrid, 100);
+      setTimeout(() => {
+        updateVideoGrid();
+        clampPresenterOverlay();
+        updateScreenStageControls();
+      }, 100);
     });
   }
   

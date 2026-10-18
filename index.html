@@ -102,6 +102,22 @@
       <div id="videoGrid" class="video-grid">
         <!-- Videos will be added here dynamically -->
       </div>
+
+      <section id="screenStage" class="screen-stage hidden" aria-label="Screen presentation">
+        <video id="screenStageVideo" class="screen-stage-video" autoplay playsinline></video>
+        <div id="presenterOverlay" class="presenter-overlay">
+          <video id="presenterOverlayVideo" autoplay playsinline muted></video>
+        </div>
+        <div class="screen-stage-toolbar" role="toolbar" aria-label="Screen presentation controls">
+          <span id="screenStageLabel" class="screen-stage-label">Screen sharing</span>
+          <button class="btn-icon-small" id="screenPinBtn" data-action="toggle-screen-pin" title="Unpin screen" aria-label="Unpin screen" aria-pressed="true">
+            <i class="fas fa-thumbtack"></i>
+          </button>
+          <button class="btn-icon-small" id="presenterOverlayBtn" data-action="toggle-presenter-overlay" title="Hide presenter camera" aria-label="Hide presenter camera" aria-pressed="true">
+            <i class="fas fa-user"></i>
+          </button>
+        </div>
+      </section>
       
       <!-- NEW: Captions Container -->
         <div id="captionsContainer" class="captions-container hidden" role="log" aria-live="polite" aria-label="Live captions">
@@ -175,6 +191,9 @@
           <i class="far fa-note-sticky"></i>
         </button>
         
+        <button class="control-btn hidden" id="summaryBtn" data-action="request-summary" title="Get meeting summary" aria-label="Generate and share meeting summary">
+          <i class="fas fa-file-lines"></i>
+        </button>
         <button class="control-btn hidden" id="endMeetingBtn" data-action="end-meeting" title="End Meeting for All" aria-label="End meeting for everyone">
           <i class="fas fa-stop-circle"></i>
         </button>

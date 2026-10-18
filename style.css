@@ -290,6 +290,113 @@ body {
   box-sizing: border-box;
 }
 
+
+.video-grid.screen-focused {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.screen-stage {
+  position: absolute;
+  inset: 8px;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: 12px;
+  background: #050505;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  transition: inset 0.2s ease, width 0.2s ease, height 0.2s ease;
+}
+
+.screen-stage:not(.screen-pinned) {
+  inset: 16px 16px auto auto;
+  width: min(44vw, 560px);
+  height: min(38vh, 360px);
+  min-width: 220px;
+  min-height: 150px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+}
+
+.screen-stage-video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  object-position: center;
+  background: #050505;
+}
+
+.screen-stage-toolbar {
+  position: absolute;
+  top: 10px;
+  left: 12px;
+  right: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  z-index: 3;
+  pointer-events: none;
+}
+
+.screen-stage-toolbar > * {
+  pointer-events: auto;
+}
+
+.screen-stage-label {
+  margin-right: auto;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.62);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.screen-stage-toolbar .btn-icon-small {
+  width: 34px;
+  height: 34px;
+  background: rgba(0, 0, 0, 0.62);
+  color: white;
+}
+
+.presenter-overlay {
+  position: absolute;
+  left: auto;
+  top: auto;
+  right: 16px;
+  bottom: 16px;
+  width: clamp(96px, 16.667%, 320px);
+  aspect-ratio: 16 / 9;
+  min-height: 54px;
+  z-index: 4;
+  overflow: hidden;
+  border: 2px solid rgba(255, 255, 255, 0.9);
+  border-radius: 10px;
+  background: #202124;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  cursor: grab;
+  touch-action: none;
+}
+
+.presenter-overlay:active {
+  cursor: grabbing;
+}
+
+.presenter-overlay video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transform: scaleX(-1);
+}
+
+.screen-stage:not(.screen-pinned) .presenter-overlay {
+  width: clamp(88px, 24%, 150px);
+  right: 10px;
+  bottom: 10px;
+}
+
 /* ========================================================
    Dynamic Grid Layouts (Google Meet Adaptive Layout)
    ======================================================== */
@@ -701,6 +808,12 @@ body {
   color: white;
 }
 
+.control-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
+}
+
 /* NEW: Recording button animation */
 .control-btn.recording {
   animation: pulse-recording 1.5s ease-in-out infinite;
@@ -1089,6 +1202,12 @@ body {
 
 .chat-message.remote {
   align-self: flex-start;
+}
+
+.meeting-summary-message .message-bubble {
+  border: 1px solid rgba(138, 180, 248, 0.55);
+  background: rgba(26, 115, 232, 0.16);
+  white-space: pre-wrap;
 }
 
 .message-sender {
@@ -1506,6 +1625,26 @@ body {
   .side-panel {
     width: 100%;
     right: -100%;
+  }
+
+  .screen-stage {
+    inset: 6px;
+    border-radius: 8px;
+  }
+
+  .screen-stage:not(.screen-pinned) {
+    inset: 10px 10px auto auto;
+    width: min(72vw, 360px);
+    height: min(32vh, 240px);
+    min-width: 180px;
+    min-height: 120px;
+  }
+
+  .screen-stage-label {
+    max-width: 48%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .background-options {
