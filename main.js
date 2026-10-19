@@ -24,6 +24,7 @@ let sessionToken = null;
 let ws = null;
 let socketAuthenticated = false;
 let signalingSocketEpoch = 0;
+let signalingMessageQueue = Promise.resolve();
 let activeServerIndex = null;
 let localStream = null;
 let screenStream = null;
@@ -83,6 +84,7 @@ let googleInitAttempts = 0;
 
 // ===== NEW: CAPTIONS & TRANSLATION STATE =====
 let captionsEnabled = false;
+let captionsDisplayEnabled = true;
 let recognition = null;
 let captionLanguage = 'en-US'; // The language I *speak*
 let myPreferredLanguage = 'en-US'; // The language I *want to read*
@@ -100,6 +102,7 @@ const MAX_GROQ_UPLOAD_QUEUE = 3;
 let groqChunkNumber = 0;
 let browserRecognitionFailures = 0;
 let groqFailureCount = 0;
+let groqFailureNotified = false;
 let groqCaptureSessionId = null;
 let browserCaptionId = null;
 let summaryState = 'not_requested';
@@ -439,14 +442,21 @@ function initWebSocket() {
     }
   };
 
-  socket.onmessage = async (evt) => {
+  socket.onmessage = evt => {
     if (ws !== socket) return;
+    let data;
     try {
-      const data = JSON.parse(evt.data);
-      await handleSignalingMessage(data, socketEpoch);
+      data = JSON.parse(evt.data);
     } catch (err) {
       console.error('Failed to parse message:', err);
+      return;
     }
+    signalingMessageQueue = signalingMessageQueue
+      .then(() => {
+        if (ws !== socket || socketEpoch !== signalingSocketEpoch) return;
+        return handleSignalingMessage(data, socketEpoch);
+      })
+      .catch(err => console.error('Failed to handle signaling message:', err));
   };
 
   socket.onerror = () => {
@@ -875,8 +885,9 @@ async function handleSignalingMessage(data, socketEpoch = signalingSocketEpoch) 
 
     // NEW: Handle caption messages with translation
     case 'caption':
-      if (captionsEnabled && data.fromClientId && data.fromClientId !== clientId) {
-        displayCaption(data.fromUsername, data.text, data.isFinal, data.language, data.fromClientId);
+      if (captionsDisplayEnabled && data.fromClientId && data.fromClientId !== clientId) {
+        showCaptionsContainer();
+        displayCaption(data.fromUsername, data.text, data.isFinal, data.language, data.fromClientId, data.captionId);
       }
       break;
 
@@ -943,20 +954,45 @@ async function handleSignalingMessage(data, socketEpoch = signalingSocketEpoch) 
 
 const clientTranslationCache = new Map();
 let translationFailureNotified = false;
+const captionRenderStates = new Map();
+const captionFadeTimers = new Map();
+
+function normalizeCaptionLanguage(language, fallback = 'en-US') {
+  const value = String(language || '').trim();
+  return Object.prototype.hasOwnProperty.call(CAPTION_LANGUAGES, value) ? value : fallback;
+}
+
+function captionLanguageBase(language) {
+  return normalizeCaptionLanguage(language).split('-')[0].toLowerCase();
+}
+
+function captionsUseSameLanguage(sourceLanguage, targetLanguage) {
+  return captionLanguageBase(sourceLanguage) === captionLanguageBase(targetLanguage);
+}
+
+function captionStateKey(username, speakerClientId = null) {
+  return captionSpeakerKey(username, speakerClientId);
+}
+
+function currentCaptionState(username, speakerClientId = null) {
+  return captionRenderStates.get(captionStateKey(username, speakerClientId)) || null;
+}
 
 /**
  * Calls our backend proxy to translate text with caching and fast fallback.
  */
 async function translateText(text, sourceLang, targetLang, callback) {
   const cleanText = String(text || '').trim();
-  if (!cleanText || sourceLang === targetLang) {
-    callback(cleanText);
+  const source = normalizeCaptionLanguage(sourceLang);
+  const target = normalizeCaptionLanguage(targetLang);
+  if (!cleanText || captionsUseSameLanguage(source, target)) {
+    callback(cleanText, 'same-language');
     return;
   }
 
-  const cacheKey = `${sourceLang}->${targetLang}:${cleanText.toLowerCase()}`;
+  const cacheKey = `${source}->${target}:${cleanText.toLowerCase()}`;
   if (clientTranslationCache.has(cacheKey)) {
-    callback(clientTranslationCache.get(cacheKey));
+    callback(clientTranslationCache.get(cacheKey), 'translated');
     return;
   }
 
@@ -966,12 +1002,12 @@ async function translateText(text, sourceLang, targetLang, callback) {
       hasEndpoint: Boolean(apiUrl),
       hasSession: Boolean(sessionToken)
     });
-    callback(cleanText);
+    callback('', 'unavailable');
     return;
   }
 
   try {
-    console.log('🌐 Translating caption:', { sourceLang, targetLang, endpoint: apiUrl });
+    console.log('🌐 Translating caption:', { sourceLang: source, targetLang: target, endpoint: apiUrl });
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 6000);
     const response = await fetch(apiUrl, {
@@ -982,8 +1018,8 @@ async function translateText(text, sourceLang, targetLang, callback) {
       },
       body: JSON.stringify({
         text: cleanText,
-        sourceLang,
-        targetLang
+        sourceLang: source,
+        targetLang: target
       }),
       signal: controller.signal
     });
@@ -998,7 +1034,7 @@ async function translateText(text, sourceLang, targetLang, callback) {
           clientTranslationCache.delete(oldest);
         }
         clientTranslationCache.set(cacheKey, result.translatedText);
-        callback(result.translatedText);
+        callback(result.translatedText, 'translated');
         return;
       }
     }
@@ -1007,14 +1043,14 @@ async function translateText(text, sourceLang, targetLang, callback) {
       translationFailureNotified = true;
       showToast('Translation service is unavailable; showing original captions.', 'error');
     }
-    callback(cleanText);
+    callback('', 'unavailable');
   } catch (error) {
     console.warn('Translation request error:', error.message);
     if (!translationFailureNotified) {
       translationFailureNotified = true;
       showToast('Translation request failed; showing original captions.', 'error');
     }
-    callback(cleanText);
+    callback('', 'unavailable');
   }
 }
 
@@ -1026,7 +1062,7 @@ function captionSpeakerKey(username, speakerClientId = null) {
   return String(speakerClientId || username || 'participant');
 }
 
-function renderCaption(username, text, isFinal, speakerClientId = null) {
+function renderCaption(username, text, isFinal, speakerClientId = null, historyKey = null, recordHistory = true) {
   const container = document.getElementById('captionsDisplay');
   if (!container) return;
   const speakerKey = captionSpeakerKey(username, speakerClientId);
@@ -1039,60 +1075,106 @@ function renderCaption(username, text, isFinal, speakerClientId = null) {
     container.appendChild(captionElement);
   }
 
+  const previousFadeTimer = captionFadeTimers.get(speakerKey);
+  if (previousFadeTimer) clearTimeout(previousFadeTimer);
+  captionFadeTimers.delete(speakerKey);
+  captionElement.style.opacity = '1';
+
   captionElement.innerHTML = `
     <span class="caption-speaker">${escapeHtml(username)}:</span>
     <span class="caption-text ${isFinal ? 'final' : 'interim'}">${escapeHtml(text)}</span>
   `;
 
-  if (isFinal) {
-    captionHistory.push({
-      username,
-      speakerClientId,
-      text,
-      timestamp: Date.now()
-    });
-    if (captionHistory.length > MAX_CAPTION_HISTORY) captionHistory.shift();
-    setTimeout(() => {
+  if (isFinal && recordHistory) {
+    const alreadyRecorded = historyKey && captionHistory.some(entry => entry.captionId === historyKey);
+    if (!alreadyRecorded) {
+      captionHistory.push({
+        captionId: historyKey,
+        username,
+        speakerClientId,
+        text,
+        language: myPreferredLanguage,
+        timestamp: Date.now()
+      });
+      if (captionHistory.length > MAX_CAPTION_HISTORY) captionHistory.shift();
+    }
+    const fadeTimer = setTimeout(() => {
       if (captionElement && captionElement.querySelector('.caption-text.final')) {
         captionElement.style.opacity = '0';
         setTimeout(() => captionElement?.remove(), 500);
       }
+      captionFadeTimers.delete(speakerKey);
     }, 3000);
+    captionFadeTimers.set(speakerKey, fadeTimer);
   }
 
   container.scrollTop = container.scrollHeight;
 }
 
-function displayCaption(username, text, isFinal, sourceLanguage = 'en-US', speakerClientId = null) {
+function displayCaption(username, text, isFinal, sourceLanguage = 'en-US', speakerClientId = null, captionId = null) {
   const speakerKey = captionSpeakerKey(username, speakerClientId);
-  const needsTranslation = sourceLanguage && sourceLanguage !== myPreferredLanguage;
+  const source = normalizeCaptionLanguage(sourceLanguage);
+  const target = normalizeCaptionLanguage(myPreferredLanguage);
+  const stableCaptionId = captionId || `${speakerKey}:${Date.now()}`;
+  const previousState = captionRenderStates.get(speakerKey);
+  const state = {
+    username,
+    speakerClientId,
+    captionId: stableCaptionId,
+    sourceText: String(text || '').trim(),
+    sourceLanguage: source,
+    isFinal,
+    generation: (previousState?.generation || 0) + 1,
+    targetLanguage: target
+  };
+  captionRenderStates.set(speakerKey, state);
+
+  const needsTranslation = !captionsUseSameLanguage(source, target);
 
   if (!needsTranslation) {
-    renderCaption(username, text, isFinal, speakerClientId);
+    renderCaption(username, state.sourceText, isFinal, speakerClientId, stableCaptionId);
     return;
   }
 
   if (isFinal) {
-    clearTimeout(translationTimeouts.get(speakerKey));
-    translationTimeouts.delete(speakerKey);
-    translationCache.delete(speakerKey);
-
-    const cacheKey = `${sourceLanguage}->${myPreferredLanguage}:${text.trim().toLowerCase()}`;
+    const cacheKey = `${source}->${target}:${state.sourceText.toLowerCase()}`;
     if (clientTranslationCache.has(cacheKey)) {
-      renderCaption(username, clientTranslationCache.get(cacheKey), true, speakerClientId);
+      renderCaption(username, clientTranslationCache.get(cacheKey), true, speakerClientId, stableCaptionId);
       return;
     }
 
-    renderCaption(username, `${text} (Translating…)`, false, speakerClientId);
-    translateText(text, sourceLanguage, myPreferredLanguage, translatedText => {
-      renderCaption(username, translatedText, true, speakerClientId);
+    // Do not show Japanese text to a Hindi reader (or vice versa) while the
+    // provider is working. The reader sees a neutral status instead.
+    renderCaption(username, 'Translating…', false, speakerClientId, stableCaptionId, false);
+    translateText(state.sourceText, source, target, (translatedText, status) => {
+      const latest = currentCaptionState(username, speakerClientId);
+      if (
+        !latest ||
+        latest.captionId !== stableCaptionId ||
+        latest.generation !== state.generation ||
+        latest.targetLanguage !== myPreferredLanguage
+      ) return;
+      const output = status === 'translated' ? translatedText : 'Translation unavailable';
+      renderCaption(username, output, true, speakerClientId, stableCaptionId, true);
     });
   } else {
-    // Interim recognition changes rapidly. Keep it local and translate only
-    // final captions so one speaker cannot exhaust the translation quota or
-    // overwrite a final caption with a late interim response.
-    renderCaption(username, text, false, speakerClientId);
+    // Interim recognition changes rapidly. Never expose source-language text
+    // to a reader who selected another language; the final caption will be
+    // translated once it is stable.
+    renderCaption(username, 'Translating…', false, speakerClientId, stableCaptionId, false);
   }
+}
+
+function retranslateActiveCaptions() {
+  const states = Array.from(captionRenderStates.values());
+  states.forEach(state => displayCaption(
+    state.username,
+    state.sourceText,
+    state.isFinal,
+    state.sourceLanguage,
+    state.speakerClientId,
+    state.captionId
+  ));
 }
 
 function initSpeechRecognition() {
@@ -1133,13 +1215,13 @@ function initSpeechRecognition() {
     if (finalTranscript) {
       browserRecognitionFailures = 0;
       browserCaptionId ||= createClientToken();
-      displayCaption(googleUser?.name || 'You', finalTranscript.trim(), true, captionLanguage, clientId);
+      displayCaption(googleUser?.name || 'You', finalTranscript.trim(), true, captionLanguage, clientId, browserCaptionId);
       sendCaption(finalTranscript.trim(), true, browserCaptionId);
       browserCaptionId = null;
     } else if (interimTranscript) {
       browserRecognitionFailures = 0;
       browserCaptionId ||= createClientToken();
-      displayCaption(googleUser?.name || 'You', interimTranscript.trim(), false, captionLanguage, clientId);
+      displayCaption(googleUser?.name || 'You', interimTranscript.trim(), false, captionLanguage, clientId, browserCaptionId);
       sendCaption(interimTranscript.trim(), false, browserCaptionId);
     }
   };
@@ -1190,6 +1272,20 @@ function toggleCaptions() {
   }
 }
 
+function showCaptionsContainer() {
+  const container = document.getElementById('captionsContainer');
+  if (!container) return;
+  container.classList.remove('hidden');
+  container.removeAttribute('aria-hidden');
+}
+
+function hideCaptionsContainer() {
+  const container = document.getElementById('captionsContainer');
+  if (!container) return;
+  container.classList.add('hidden');
+  container.setAttribute('aria-hidden', 'true');
+}
+
 function startCaptions() {
   if (!localStream || localStream.getAudioTracks().length === 0) {
     showToast('Cannot start captions: microphone not available', 'error');
@@ -1197,11 +1293,8 @@ function startCaptions() {
   }
 
   captionsEnabled = true;
-  const container = document.getElementById('captionsContainer');
-  if (container) {
-    container.classList.remove('hidden');
-    container.removeAttribute('aria-hidden');
-  }
+  captionsDisplayEnabled = true;
+  showCaptionsContainer();
 
   if (!recognition && initSpeechRecognition()) {
     captionProvider = 'browser';
@@ -1256,6 +1349,7 @@ function startGroqCaptionCapture() {
     groqUploadQueue = [];
     groqChunkNumber = 0;
     groqFailureCount = 0;
+    groqFailureNotified = false;
     groqCaptureSessionId = createClientToken();
     groqRecorder = new MediaRecorder(new MediaStream(audioTracks), { mimeType });
     groqRecorder.ondataavailable = event => {
@@ -1297,15 +1391,26 @@ async function flushGroqUploadQueue() {
       body: item.blob
     });
     const result = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(result.error || `Groq transcription failed (${response.status})`);
+    if (!response.ok) {
+      const providerError = result.error || `Groq transcription failed (${response.status})`;
+      console.warn('Groq caption endpoint rejected audio:', response.status, providerError);
+      throw new Error(`${providerError} [HTTP ${response.status}]`);
+    }
     groqFailureCount = 0;
     if (result.text) {
-      displayCaption(googleUser?.name || 'You', result.text, true, captionLanguage, clientId);
+      displayCaption(googleUser?.name || 'You', result.text, true, captionLanguage, clientId, result.captionId || createClientToken());
     }
 
   } catch (error) {
     groqFailureCount += 1;
     console.warn('Groq transcription failed:', error.message);
+    if (!groqFailureNotified) {
+      groqFailureNotified = true;
+      const message = /not configured/i.test(error.message || '')
+        ? 'Groq captions are not configured on the meeting server.'
+        : 'Groq caption transcription failed; retrying with the browser provider.';
+      showToast(message, 'error');
+    }
     if (groqFailureCount >= 2) switchToBrowserCaptions('Groq captions are unavailable');
   } finally {
     groqUploadBusy = false;
@@ -1321,6 +1426,8 @@ function switchToGroqCaptions(reason) {
   captionProvider = 'groq';
   if (!startGroqCaptionCapture()) {
     captionsEnabled = false;
+    captionsDisplayEnabled = false;
+    hideCaptionsContainer();
     updateCaptionsButton();
     showToast('Neither browser captions nor Groq fallback is available.', 'error');
     return;
@@ -1336,6 +1443,8 @@ function switchToBrowserCaptions(reason) {
   groqUploadQueue = [];
   if (!recognition && !initSpeechRecognition()) {
     captionsEnabled = false;
+    captionsDisplayEnabled = false;
+    hideCaptionsContainer();
     updateCaptionsButton();
     showToast('Browser captions are unavailable.', 'error');
     return;
@@ -1367,21 +1476,22 @@ function stopCaptions() {
   groqUploadQueue = [];
   groqUploadBusy = false;
   groqCaptureSessionId = null;
+  groqFailureNotified = false;
   browserCaptionId = null;
   captionProvider = 'browser';
 
   captionsEnabled = false;
+  captionsDisplayEnabled = false;
   translationTimeouts.forEach(timeout => clearTimeout(timeout));
   translationTimeouts.clear();
   translationCache.clear();
+  captionRenderStates.clear();
+  captionFadeTimers.forEach(timer => clearTimeout(timer));
+  captionFadeTimers.clear();
   updateCaptionsButton();
 
   // Hide captions container
-  const container = document.getElementById('captionsContainer');
-  if (container) {
-    container.classList.add('hidden');
-    container.setAttribute('aria-hidden', 'true');
-  }
+  hideCaptionsContainer();
 
   // Clear caption display
   clearCaptions();
@@ -1501,6 +1611,8 @@ function applyCaptionSettings() {
       }, 500);
     }
   }
+
+  retranslateActiveCaptions();
 
   showToast(`Settings updated: Speaking ${CAPTION_LANGUAGES[captionLanguage]}, Reading ${CAPTION_LANGUAGES[myPreferredLanguage]}`, 'success');
 }
@@ -2940,6 +3052,7 @@ function createPeerConnection(id, username) {
     remoteScreenStream: new MediaStream(),
     pendingRemoteTracks: [],
     mediaReady: Promise.resolve(),
+    offerInFlight: null,
     iceCandidateQueue: [],
     remoteDescriptionSet: false
   };
@@ -3036,36 +3149,52 @@ function createPeerConnection(id, username) {
 async function createOffer(targetId, targetUsername, socketEpoch = signalingSocketEpoch) {
   if (!isSafeClientId(targetId)) return;
   if (socketEpoch !== signalingSocketEpoch) return;
-  console.log(`📤 Creating offer for ${targetId}`);
 
   const pc = createPeerConnection(targetId, targetUsername);
   const peer = peers[targetId];
+  if (!peer || !pc) return;
+  if (peer.offerInFlight) {
+    console.log(`⏳ Offer already in flight for ${targetId}; reusing it`);
+    return peer.offerInFlight;
+  }
 
-  try {
-    if (socketEpoch !== signalingSocketEpoch || !peer || pc.signalingState !== 'stable') {
-      console.warn(`⏭️ Skipping offer for ${targetId}; signaling state is ${pc.signalingState}`);
-      return;
+  const offerOperation = (async () => {
+    try {
+      if (socketEpoch !== signalingSocketEpoch || pc.signalingState !== 'stable') {
+        console.warn(`⏭️ Skipping offer for ${targetId}; signaling state is ${pc.signalingState}`);
+        return;
+      }
+      console.log(`📤 Creating offer for ${targetId}`);
+      // Candidates emitted for this offer must wait until its answer becomes
+      // the current remote description, including ICE-restart offers.
+      peer.remoteDescriptionSet = false;
+      await peer.mediaReady;
+      if (socketEpoch !== signalingSocketEpoch || peers[targetId] !== peer || pc.signalingState !== 'stable') return;
+      const offer = await pc.createOffer({
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: true
+      });
+
+      await pc.setLocalDescription(offer);
+      if (socketEpoch !== signalingSocketEpoch || peers[targetId] !== peer) return;
+
+      sendSignalingMessage({
+        type: 'offer',
+        sdp: pc.localDescription,
+        targetClientId: targetId
+      }, socketEpoch);
+
+      console.log(`📨 Offer sent to ${targetId}`);
+    } catch (err) {
+      console.error(`❌ Failed to create offer for ${targetId}:`, err);
     }
-    // Candidates emitted for this offer must wait until its answer becomes
-    // the current remote description, including ICE-restart offers.
-    peer.remoteDescriptionSet = false;
-    await peer.mediaReady;
-    const offer = await pc.createOffer({
-      offerToReceiveAudio: true,
-      offerToReceiveVideo: true
-    });
+  })();
 
-    await pc.setLocalDescription(offer);
-
-    sendSignalingMessage({
-      type: 'offer',
-      sdp: pc.localDescription,
-      targetClientId: targetId
-    }, socketEpoch);
-
-    console.log(`📨 Offer sent to ${targetId}`);
-  } catch (err) {
-    console.error(`❌ Failed to create offer for ${targetId}:`, err);
+  peer.offerInFlight = offerOperation;
+  try {
+    return await offerOperation;
+  } finally {
+    if (peer.offerInFlight === offerOperation) peer.offerInFlight = null;
   }
 }
 
@@ -3819,6 +3948,11 @@ function leaveMeeting(force = false) {
   summaryId = null;
   screenShareOwnerId = null;
   screenStageStream = null;
+  captionsDisplayEnabled = true;
+  captionHistory = [];
+  captionRenderStates.clear();
+  captionFadeTimers.forEach(timer => clearTimeout(timer));
+  captionFadeTimers.clear();
   participantsState.clear();
 
   showLandingPage();
