@@ -715,6 +715,13 @@ body {
   margin-bottom: 20px;
 }
 
+.settings-help {
+  margin: 0 0 18px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .settings-group label {
   display: block;
   font-size: 14px;
@@ -1727,6 +1734,81 @@ body {
 
   .video-overlay {
     padding: 6px;
+  }
+}
+
+/* === Media isolation and production layout guardrails === */
+.remote-audio-container {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  pointer-events: none;
+}
+
+.remote-audio-container audio {
+  width: 1px;
+  height: 1px;
+}
+
+.screen-stage.hidden {
+  display: none;
+}
+
+@media (min-width: 769px) {
+  .meeting-room {
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
+  }
+
+  .video-container {
+    min-height: 0;
+  }
+
+  #videoGrid {
+    grid-auto-flow: row;
+    grid-auto-rows: minmax(0, 1fr);
+    align-content: center;
+  }
+}
+
+@media (max-width: 768px) {
+  .meeting-room {
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
+  }
+
+  .video-container {
+    min-height: 0;
+  }
+
+  #videoGrid {
+    overflow-y: auto;
+    align-content: start;
+    grid-template-columns: 1fr !important;
+    grid-template-rows: none !important;
+    grid-auto-rows: minmax(180px, 42vh);
+  }
+
+  #videoGrid .video-wrapper {
+    min-height: 180px;
+    aspect-ratio: 16 / 9;
+    grid-column: auto !important;
+    grid-row: auto !important;
+  }
+
+  .screen-stage:not(.screen-pinned) {
+    width: min(82vw, 360px);
+    height: min(34dvh, 240px);
+    min-width: 0;
+    min-height: 0;
+  }
+
+  .controls-bar {
+    padding-bottom: max(8px, env(safe-area-inset-bottom));
   }
 }
 

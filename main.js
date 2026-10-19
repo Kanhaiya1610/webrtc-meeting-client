@@ -24,6 +24,7 @@ let sessionToken = null;
 let ws = null;
 let socketAuthenticated = false;
 let signalingSocketEpoch = 0;
+let activeServerIndex = null;
 let localStream = null;
 let screenStream = null;
 let clientId = null;
@@ -50,6 +51,7 @@ let isRecording = false;
 let recordingFrameId = null;
 let peers = {};
 let pendingIceCandidates = new Map();
+let remoteAudioElements = new Map();
 let participantsState = new Map();
 let pcConfig = {
   // Keep a usable baseline immediately. The authenticated /ice request can
@@ -155,6 +157,14 @@ function isSafeClientId(value) {
 // or both browsers process room state at the same time.
 function shouldInitiatePeer(targetId) {
   return isSafeClientId(clientId) && isSafeClientId(targetId) && clientId < targetId;
+}
+
+function isMobileBrowser() {
+  return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '');
+}
+
+function getActiveServerEndpoint() {
+  return SERVER_ENDPOINTS[activeServerIndex ?? currentServerIndex] || null;
 }
 
 function handleActionClick(event) {
@@ -412,6 +422,7 @@ function initWebSocket() {
 
   const currentEndpoint = SERVER_ENDPOINTS[currentServerIndex];
   const socketEpoch = ++signalingSocketEpoch;
+  activeServerIndex = currentServerIndex;
   intentionalSocketClose = false;
   const socket = new WebSocket(currentEndpoint.ws);
   ws = socket;
@@ -457,6 +468,7 @@ function initWebSocket() {
 
     ws = null;
     socketAuthenticated = false;
+    activeServerIndex = null;
     if (isInMeeting) resetPeerConnections('signaling socket closed');
     if (intentionalSocketClose) return;
     if (!googleCredential) {
@@ -741,6 +753,9 @@ async function handleSignalingMessage(data, socketEpoch = signalingSocketEpoch) 
 
     case 'screen_share_state':
       if (data.active) {
+        if (screenShareOwnerId && screenShareOwnerId !== data.clientId) {
+          clearScreenStage(screenShareOwnerId);
+        }
         screenShareOwnerId = data.clientId || null;
         showToast(`${data.username || 'A participant'} started screen sharing`, 'info');
       } else if (!data.clientId || data.clientId === screenShareOwnerId) {
@@ -927,6 +942,7 @@ async function handleSignalingMessage(data, socketEpoch = signalingSocketEpoch) 
 // ===== NEW: CAPTIONS & TRANSLATION FUNCTIONALITY =====
 
 const clientTranslationCache = new Map();
+let translationFailureNotified = false;
 
 /**
  * Calls our backend proxy to translate text with caching and fast fallback.
@@ -944,13 +960,18 @@ async function translateText(text, sourceLang, targetLang, callback) {
     return;
   }
 
-  const apiUrl = SERVER_ENDPOINTS[currentServerIndex]?.translate;
+  const apiUrl = getActiveServerEndpoint()?.translate;
   if (!apiUrl || !sessionToken) {
+    console.warn('Translation skipped: active meeting server or session is unavailable.', {
+      hasEndpoint: Boolean(apiUrl),
+      hasSession: Boolean(sessionToken)
+    });
     callback(cleanText);
     return;
   }
 
   try {
+    console.log('🌐 Translating caption:', { sourceLang, targetLang, endpoint: apiUrl });
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 6000);
     const response = await fetch(apiUrl, {
@@ -971,6 +992,7 @@ async function translateText(text, sourceLang, targetLang, callback) {
     if (response.ok) {
       const result = await response.json();
       if (result?.translatedText) {
+        translationFailureNotified = false;
         if (clientTranslationCache.size >= 500) {
           const oldest = clientTranslationCache.keys().next().value;
           clientTranslationCache.delete(oldest);
@@ -980,9 +1002,18 @@ async function translateText(text, sourceLang, targetLang, callback) {
         return;
       }
     }
+    console.warn(`Translation request failed with HTTP ${response.status}.`, apiUrl);
+    if (!translationFailureNotified) {
+      translationFailureNotified = true;
+      showToast('Translation service is unavailable; showing original captions.', 'error');
+    }
     callback(cleanText);
   } catch (error) {
     console.warn('Translation request error:', error.message);
+    if (!translationFailureNotified) {
+      translationFailureNotified = true;
+      showToast('Translation request failed; showing original captions.', 'error');
+    }
     callback(cleanText);
   }
 }
@@ -997,7 +1028,7 @@ function captionSpeakerKey(username, speakerClientId = null) {
 
 function renderCaption(username, text, isFinal, speakerClientId = null) {
   const container = document.getElementById('captionsDisplay');
-  if (!container || (speakerClientId && speakerClientId === clientId)) return;
+  if (!container) return;
   const speakerKey = captionSpeakerKey(username, speakerClientId);
   const captionId = `caption-${Array.from(speakerKey).map(char => char.codePointAt(0).toString(16)).join('-')}`;
   let captionElement = document.getElementById(captionId);
@@ -1033,7 +1064,6 @@ function renderCaption(username, text, isFinal, speakerClientId = null) {
 }
 
 function displayCaption(username, text, isFinal, sourceLanguage = 'en-US', speakerClientId = null) {
-  if (speakerClientId && speakerClientId === clientId) return;
   const speakerKey = captionSpeakerKey(username, speakerClientId);
   const needsTranslation = sourceLanguage && sourceLanguage !== myPreferredLanguage;
 
@@ -1058,21 +1088,10 @@ function displayCaption(username, text, isFinal, sourceLanguage = 'en-US', speak
       renderCaption(username, translatedText, true, speakerClientId);
     });
   } else {
-    translationCache.set(speakerKey, text);
-    clearTimeout(translationTimeouts.get(speakerKey));
+    // Interim recognition changes rapidly. Keep it local and translate only
+    // final captions so one speaker cannot exhaust the translation quota or
+    // overwrite a final caption with a late interim response.
     renderCaption(username, text, false, speakerClientId);
-
-    const timeout = setTimeout(() => {
-      const cachedText = translationCache.get(speakerKey);
-      if (cachedText) {
-        translateText(cachedText, sourceLanguage, myPreferredLanguage, translatedText => {
-          renderCaption(username, translatedText, false, speakerClientId);
-        });
-        translationCache.delete(speakerKey);
-      }
-      translationTimeouts.delete(speakerKey);
-    }, 350);
-    translationTimeouts.set(speakerKey, timeout);
   }
 }
 
@@ -1114,11 +1133,13 @@ function initSpeechRecognition() {
     if (finalTranscript) {
       browserRecognitionFailures = 0;
       browserCaptionId ||= createClientToken();
+      displayCaption(googleUser?.name || 'You', finalTranscript.trim(), true, captionLanguage, clientId);
       sendCaption(finalTranscript.trim(), true, browserCaptionId);
       browserCaptionId = null;
     } else if (interimTranscript) {
       browserRecognitionFailures = 0;
       browserCaptionId ||= createClientToken();
+      displayCaption(googleUser?.name || 'You', interimTranscript.trim(), false, captionLanguage, clientId);
       sendCaption(interimTranscript.trim(), false, browserCaptionId);
     }
   };
@@ -1136,7 +1157,7 @@ function initSpeechRecognition() {
           }
         }, 1000);
       }
-    } else if (['not-allowed', 'service-not-allowed', 'network', 'language-not-supported'].includes(event.error)) {
+    } else if (['not-allowed', 'service-not-allowed', 'network', 'language-not-supported', 'audio-capture'].includes(event.error)) {
       browserRecognitionFailures += 1;
       if (browserRecognitionFailures >= 1) switchToGroqCaptions(`Browser captions unavailable (${event.error})`);
     }
@@ -1202,7 +1223,7 @@ function startCaptions() {
 }
 
 function getGroqTranscriptionEndpoint() {
-  return SERVER_ENDPOINTS[currentServerIndex]?.transcribe || null;
+  return getActiveServerEndpoint()?.transcribe || null;
 }
 
 function getSupportedAudioMimeType() {
@@ -1215,6 +1236,13 @@ function startGroqCaptionCapture() {
   const audioTracks = localStream?.getAudioTracks?.() || [];
   const mimeType = getSupportedAudioMimeType();
   if (!endpoint || !sessionToken || audioTracks.length === 0 || !window.MediaRecorder || !mimeType) {
+    console.warn('Groq captions unavailable:', {
+      hasEndpoint: Boolean(endpoint),
+      hasSession: Boolean(sessionToken),
+      audioTracks: audioTracks.length,
+      mediaRecorder: Boolean(window.MediaRecorder),
+      mimeType
+    });
     return false;
   }
 
@@ -1271,7 +1299,9 @@ async function flushGroqUploadQueue() {
     const result = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(result.error || `Groq transcription failed (${response.status})`);
     groqFailureCount = 0;
-    // The server broadcasts this caption to other participants only.
+    if (result.text) {
+      displayCaption(googleUser?.name || 'You', result.text, true, captionLanguage, clientId);
+    }
 
   } catch (error) {
     groqFailureCount += 1;
@@ -1417,6 +1447,7 @@ function showCaptionSettings() {
   modal.innerHTML = `
     <div class="modal-content">
       <h3>Caption Settings</h3>
+      <p class="settings-help">Browser captions are generated locally when supported. Translation is requested only when your reading language differs from the speaker's language; the server translation provider is Gemini.</p>
 
       <div class="settings-group">
         <label for="captionLanguageSelect">Spoken Language (What I speak)</label>
@@ -1908,19 +1939,23 @@ async function setupLocalStream() {
       localStream = await navigator.mediaDevices.getUserMedia(fullConstraints);
     } catch (fullError) {
       console.warn('Combined camera/microphone permission failed:', fullError.name);
+      // Request each device independently. The previous fallback stopped at
+      // the first successful video-only request, which silently removed the
+      // microphone and created one-way audio calls.
+      localStream = new MediaStream();
       const fallbackConstraints = [
-        { video: fullConstraints.video, audio: false },
-        { video: false, audio: fullConstraints.audio }
+        { label: 'camera', constraints: { video: fullConstraints.video, audio: false } },
+        { label: 'microphone', constraints: { video: false, audio: fullConstraints.audio } }
       ];
-      for (const constraints of fallbackConstraints) {
+      for (const { label, constraints } of fallbackConstraints) {
         try {
-          localStream = await navigator.mediaDevices.getUserMedia(constraints);
-          break;
+          const partialStream = await navigator.mediaDevices.getUserMedia(constraints);
+          partialStream.getTracks().forEach(track => localStream.addTrack(track));
         } catch (fallbackError) {
-          console.warn('Media fallback failed:', fallbackError.name);
+          console.warn(`${label} media fallback failed:`, fallbackError.name);
         }
       }
-      if (!localStream) throw fullError;
+      if (localStream.getTracks().length === 0) throw fullError;
       showToast('Joined with limited media access. You can retry your camera or microphone later.', 'info');
     }
 
@@ -1999,15 +2034,22 @@ async function replaceCameraTrack(track) {
 }
 
 async function replaceScreenTrack(track) {
+  let successful = true;
   for (const [peerId, peer] of Object.entries(peers)) {
     const sender = peer.screenTransceiver?.sender;
-    if (!sender) continue;
+    if (!sender) {
+      successful = false;
+      console.warn(`Could not find screen sender for ${peerId}`);
+      continue;
+    }
     try {
       await sender.replaceTrack(track || null);
     } catch (error) {
+      successful = false;
       console.warn(`Could not replace screen track for ${peerId}:`, error.message);
     }
   }
+  return successful;
 }
 
 function updateLocalVideoPreview() {
@@ -2202,6 +2244,10 @@ function updateBackgroundFilterButton() {
 
 // ===== SCREEN SHARING =====
 async function toggleScreenShare() {
+  if (isMobileBrowser()) {
+    showToast('Screen sharing is disabled on mobile browsers for now.', 'info');
+    return;
+  }
   if (!isScreenSharing) {
     try {
       console.log('🖥️ Starting screen share...');
@@ -2209,11 +2255,11 @@ async function toggleScreenShare() {
       if (!window.isSecureContext || !navigator.mediaDevices?.getDisplayMedia) {
         throw new Error('Screen sharing is not supported in this browser or context. Use HTTPS and a supported browser.');
       }
-      const isMobileBrowser = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '');
       screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: isMobileBrowser ? true : {
+        video: {
           cursor: 'always',
-          displaySurface: 'monitor'
+          displaySurface: 'monitor',
+          selfBrowserSurface: 'exclude'
         },
         audio: false
       });
@@ -2225,15 +2271,26 @@ async function toggleScreenShare() {
       };
 
       isScreenSharing = true;
+      clearScreenStage();
       screenShareOwnerId = clientId;
-      await replaceScreenTrack(screenTrack);
-      showScreenStage(clientId, screenStream);
+      if (!await replaceScreenTrack(screenTrack)) {
+        throw new Error('Screen share sender is not available for one or more participants.');
+      }
+      // Never render the local display capture back into the meeting. If the
+      // user shares this tab/monitor, doing so creates a hall-of-mirrors loop.
+      updateScreenStageControls();
       sendSignalingMessage({ type: 'screen_share_state', active: true });
       updateScreenShareButton();
       showToast('Screen sharing started', 'success');
 
     } catch (err) {
       console.error('❌ Screen share failed:', err);
+      screenStream?.getTracks?.().forEach(track => track.stop());
+      screenStream = null;
+      isScreenSharing = false;
+      screenShareOwnerId = null;
+      clearScreenStage();
+      updateScreenShareButton();
       if (err?.name === 'NotAllowedError') {
         showToast('Screen sharing was cancelled or blocked by the browser.', 'info');
       } else if (err?.name === 'NotSupportedError' || /not supported/i.test(err?.message || '')) {
@@ -2284,6 +2341,14 @@ async function stopScreenShare() {
 function updateScreenShareButton() {
   const btn = document.getElementById('screenShareBtn');
   if (!btn) return;
+
+  if (isMobileBrowser()) {
+    btn.classList.add('hidden');
+    btn.disabled = true;
+    return;
+  }
+  btn.classList.remove('hidden');
+  btn.disabled = false;
 
   const icon = btn.querySelector('i');
 
@@ -2466,7 +2531,7 @@ function getParticipantVideoStream(participantId) {
   if (participantId === clientId) {
     return backgroundEffect !== 'none' && backgroundPipeline?.stream ? backgroundPipeline.stream : localStream;
   }
-  return document.querySelector(`#video-${participantId} video`)?.srcObject || null;
+  return peers[participantId]?.remoteCameraStream || null;
 }
 
 function updatePresenterOverlay() {
@@ -2517,7 +2582,7 @@ function updateScreenStageControls() {
 }
 
 function showScreenStage(ownerId, stream) {
-  if (!stream) return;
+  if (!stream || !ownerId || ownerId === clientId) return;
   screenShareOwnerId = ownerId || screenShareOwnerId;
   screenStageStream = stream;
   screenPinned = true;
@@ -2541,6 +2606,7 @@ function clearScreenStage(ownerId = null) {
   if (video) video.srcObject = null;
   if (presenterVideo) presenterVideo.srcObject = null;
   document.getElementById('videoGrid')?.classList.remove('screen-focused');
+  updateScreenStageControls();
 }
 
 function toggleScreenPin() {
@@ -2594,12 +2660,38 @@ function initPresenterOverlayDrag() {
 }
 
 function resumeRemotePlayback() {
-  document.querySelectorAll('#videoGrid video, #screenStageVideo').forEach(video => {
+  document.querySelectorAll('#videoGrid video, #remoteAudioContainer audio, #screenStageVideo').forEach(video => {
     if (!video.srcObject || video.muted) return;
     video.play().catch(() => {
       // The browser may still require another gesture; retry on the next one.
     });
   });
+}
+
+function ensureRemoteAudioElement(id, stream) {
+  if (!isSafeClientId(id) || !stream) return null;
+  let audio = remoteAudioElements.get(id);
+  if (!audio) {
+    audio = document.createElement('audio');
+    audio.id = `remote-audio-${id}`;
+    audio.className = 'remote-audio';
+    audio.autoplay = true;
+    audio.playsInline = true;
+    audio.setAttribute('aria-hidden', 'true');
+    (document.getElementById('remoteAudioContainer') || document.body).appendChild(audio);
+    remoteAudioElements.set(id, audio);
+  }
+  if (audio.srcObject !== stream) audio.srcObject = stream;
+  requestVideoPlayback(audio, false);
+  return audio;
+}
+
+function removeRemoteAudioElement(id) {
+  const audio = remoteAudioElements.get(id);
+  if (!audio) return;
+  audio.srcObject = null;
+  audio.remove();
+  remoteAudioElements.delete(id);
 }
 
 function requestVideoPlayback(video, isLocal = false) {
@@ -2777,20 +2869,18 @@ function getRemoteTrackRole(peer, transceiver) {
   // Keep identity as a fallback for browsers that do not expose a mid on the
   // ontrack transceiver yet.
   const roleByIdentity = roleByMid.find(([, candidate]) => candidate === transceiver);
-  return roleByIdentity?.[0] || null;
+  if (roleByIdentity) return roleByIdentity[0];
+
+  const transceiverIndex = peer.pc.getTransceivers().indexOf(transceiver);
+  return ['camera', 'audio', 'screen'][transceiverIndex] || null;
 }
 
 function attachRemoteTrack(id, username, peer, event) {
   if (!peer || !event?.track) return;
 
   let role = getRemoteTrackRole(peer, event.transceiver);
-  if (!role && event.track.kind === 'video') {
-    // A few WebRTC implementations have delivered ontrack without a usable
-    // transceiver/mid. The fixed m-line order still gives us a safe fallback:
-    // the first remote video is camera, the second is screen.
-    role = peer.remoteMediaStream.getVideoTracks().length > 0 ? 'screen' : 'camera';
-  }
-  if (role === 'screen') {
+  if (!role) role = event.track.kind === 'audio' ? 'audio' : 'camera';
+  if (role === 'screen' && event.track.kind === 'video') {
     if (!peer.remoteScreenStream.getTracks().includes(event.track)) {
       peer.remoteScreenStream.addTrack(event.track);
     }
@@ -2807,10 +2897,18 @@ function attachRemoteTrack(id, username, peer, event) {
   // valid track just because a browser has not exposed its transceiver/mid at
   // the moment the ontrack event is delivered. Only a positively identified
   // screen transceiver belongs in the presentation stage.
-  if (!peer.remoteMediaStream.getTracks().includes(event.track)) {
-    peer.remoteMediaStream.addTrack(event.track);
+  if (event.track.kind === 'audio') {
+    if (!peer.remoteAudioStream.getTracks().includes(event.track)) {
+      peer.remoteAudioStream.addTrack(event.track);
+    }
+    ensureRemoteAudioElement(id, peer.remoteAudioStream);
+    return;
   }
-  addVideoElement(id, peer.remoteMediaStream, false, username);
+
+  if (!peer.remoteCameraStream.getTracks().includes(event.track)) {
+    peer.remoteCameraStream.addTrack(event.track);
+  }
+  addVideoElement(id, peer.remoteCameraStream, false, username);
 }
 
 function flushPendingRemoteTracks(id, username, peer) {
@@ -2837,7 +2935,8 @@ function createPeerConnection(id, username) {
     audioSender: null,
     screenTransceiver: null,
     screenSender: null,
-    remoteMediaStream: new MediaStream(),
+    remoteCameraStream: new MediaStream(),
+    remoteAudioStream: new MediaStream(),
     remoteScreenStream: new MediaStream(),
     pendingRemoteTracks: [],
     mediaReady: Promise.resolve(),
@@ -3071,7 +3170,10 @@ async function handleIceCandidate(fromId, candidate, socketEpoch = signalingSock
 
 // ===== MEDIA CONTROLS =====
 function toggleMic() {
-  if (!localStream) return;
+  if (!localStream?.getAudioTracks?.().length) {
+    showToast('Microphone is not available in this browser session.', 'error');
+    return;
+  }
 
   if (isAdminMuted && isMuted) {
     showRequestUnmuteModal();
@@ -3093,6 +3195,7 @@ function updateMicButton() {
   const btn = document.getElementById('toggleMicBtn');
   const icon = document.getElementById('micIcon');
   if (!btn || !icon) return;
+  btn.disabled = !localStream?.getAudioTracks?.().length;
 
   if (isMuted) {
     icon.className = 'fas fa-microphone-slash';
@@ -3611,9 +3714,15 @@ function resetPeerConnections(reason = 'reset') {
       console.warn(`Could not close peer ${id}:`, error.message);
     }
     removeVideoElement(id);
+    removeRemoteAudioElement(id);
   });
   peers = {};
   pendingIceCandidates.clear();
+  remoteAudioElements.forEach(audio => {
+    audio.srcObject = null;
+    audio.remove();
+  });
+  remoteAudioElements.clear();
 
   if (screenShareOwnerId && screenShareOwnerId !== clientId) {
     clearScreenStage(screenShareOwnerId);
@@ -3633,6 +3742,7 @@ function removePeer(id) {
     delete peers[id];
   }
   removeVideoElement(id);
+  removeRemoteAudioElement(id);
   if (screenShareOwnerId === id) clearScreenStage(id);
   removeParticipantFromList(id);
 }
@@ -3663,6 +3773,11 @@ function leaveMeeting(force = false) {
   });
   peers = {};
   pendingIceCandidates.clear();
+  remoteAudioElements.forEach(audio => {
+    audio.srcObject = null;
+    audio.remove();
+  });
+  remoteAudioElements.clear();
 
   stopBackgroundPipeline();
   backgroundEffect = 'none';
@@ -3731,6 +3846,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.addEventListener('pointerdown', resumeRemotePlayback, { passive: true });
   document.addEventListener('keydown', resumeRemotePlayback, { passive: true });
   initPresenterOverlayDrag();
+  updateScreenShareButton();
 
   await loadIceServers();
 
